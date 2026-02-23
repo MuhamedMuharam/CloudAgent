@@ -1,0 +1,6 @@
+# Core dependencies for AI Agent Cloud Infrastructure
+openai
+python-dotenv
+
+# Model Context Protocol SDK (from GitHub)
+git+https://github.com/modelcontextprotocol/python-sdk.git
