@@ -27,3 +27,30 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# State files (contains resource IDs and action history)
+state/state.json
+state/audit_log.jsonl
+
+# Keep state directory structure
+!state/.gitkeep
+
+# Cloud credentials (NEVER commit these!)
+*.pem
+*.key
+*-credentials.json
+service-account-*.json
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+
+CODE_WALKTHROUGH.md

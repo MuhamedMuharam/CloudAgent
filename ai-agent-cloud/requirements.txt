@@ -2,5 +2,16 @@
 openai
 python-dotenv
 
-# Model Context Protocol SDK (from GitHub)
-git+https://github.com/modelcontextprotocol/python-sdk.git
+# FastMCP (includes MCP SDK as dependency)
+fastmcp
+
+# AWS SDK for Python (Boto3)
+boto3
+botocore
+
+# Future cloud providers (not yet implemented)
+# azure-identity
+# azure-mgmt-compute
+# azure-mgmt-network
+# google-cloud-compute
+# google-auth
