@@ -65,13 +65,25 @@ if __name__ == "__main__":
     # The agent will use GPT-4 to reason about how to achieve this goal
     # It will then call MCP tools (via AWS server) to take actions
     
-    goal = "List all EC2 instances. If there are no running instances, create one t3.micro instance (1 CPU, 1GB RAM) to keep costs low since it's free-tier eligible. Ensure it is running."
+    goal = """
+    Create a production VPC infrastructure:
     
+    1. Create a VPC with CIDR 10.0.0.0/16 named 'test-vpc'
+    2. Create 2 public subnets:
+       - Public subnet 1: 10.0.1.0/24 in us-east-1a
+       - Public subnet 2: 10.0.2.0/24 in us-east-1b
+    3. Create 2 private subnets:
+       - Private subnet 1: 10.0.10.0/24 in us-east-1a
+       - Private subnet 2: 10.0.11.0/24 in us-east-1b
+    4. Create an Internet Gateway and attach it to the VPC
+    5. Create a NAT Gateway in the first public subnet
+    6. Create route tables:
+       - Public route table with route to Internet Gateway (0.0.0.0/0 -> IGW)
+       - Private route table with route to NAT Gateway (0.0.0.0/0 -> NAT)
+    7. Associate route tables with appropriate subnets
+    """
     # You can also test other goals:
-    # goal = "List all EC2 instances"
-    # goal = "Create a new EC2 instance called 'web-server-1' with 2 CPUs and 4GB RAM"
-    # goal = "Check the status of all instances and report which ones are running"
-    # goal = "Ensure I have exactly 2 running instances"
+   
     
     print("🚀 Starting AI Agent with MCP...\n")
     print(f"📝 Goal: {goal}\n")

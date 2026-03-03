@@ -1,0 +1,98 @@
+# AWS Security and Compliance Policies
+# This file defines rules that the AI agent must follow when managing AWS resources
+
+version: 1.0
+
+# EC2 Instance Policies
+ec2:
+  # Instance type restrictions
+  max_cpu: 4 # Maximum CPU cores (prevents expensive instances)
+  max_ram_gb: 16 # Maximum RAM in GB
+  allowed_instance_families: [t2, t3, t3a] # Cost-effective instance families
+
+  # Regional restrictions
+  allowed_regions: [us-east-1, us-east-2, us-west-1, us-west-2]
+
+  # Required tags
+  required_tags:
+    - ManagedBy # Must tag resources as managed by AI
+    - Environment # Must specify environment (dev/staging/prod)
+    - Project # Must specify project name
+
+  # Cost limits
+  max_instances_per_goal: 10 # Prevent creating too many instances at once
+  max_hourly_cost: 5.0 # Maximum estimated hourly cost in USD
+
+# VPC Networking Policies
+vpc:
+  # CIDR block restrictions
+  allowed_cidr_blocks:
+    - 10.0.0.0/8 # Private IP range
+    - 172.16.0.0/12 # Private IP range
+    - 192.168.0.0/16 # Private IP range
+
+  # CIDR block size restrictions (AWS requirement)
+  min_cidr_prefix: 16 # Minimum /16 (e.g., 10.0.0.0/16)
+  max_cidr_prefix: 28 # Maximum /28 (e.g., 10.0.0.0/28)
+
+  # VPC limits
+  max_vpcs: 5 # Prevent VPC sprawl
+  max_subnets_per_vpc: 20
+
+  # Naming requirements
+  require_name_tag: true
+
+  # Required tags for VPCs
+  required_tags:
+    - Environment
+    - Project
+
+# Security Group Policies
+security_groups:
+  # Port restrictions - CRITICAL FOR SECURITY
+  blocked_inbound_ports:
+    - 22 # SSH - should use bastion instead
+    - 3389 # RDP - Remote Desktop
+    - 23 # Telnet - insecure protocol
+    - 3306 # MySQL - databases should not be public
+    - 5432 # PostgreSQL - databases should not be public
+    - 27017 # MongoDB - databases should not be public
+    - 6379 # Redis - caches should not be public
+
+  # CIDR restrictions
+  blocked_cidrs_for_sensitive_ports:
+    - 0.0.0.0/0 # Never allow SSH/RDP/databases from anywhere
+
+  allowed_public_ports:
+    - 80 # HTTP
+    - 443 # HTTPS
+    - 8080 # Alternative HTTP
+
+  # Rule limits
+  max_rules_per_group: 50
+
+  # Require descriptions
+  require_description: true
+
+  # Protocol restrictions
+  allowed_protocols: [tcp, udp, icmp]
+
+# NAT Gateway Policies
+nat_gateway:
+  # Cost awareness - NAT Gateways cost ~$0.045/hour + data transfer
+  max_nat_gateways_per_vpc: 2 # Usually need 1-2 for HA
+  require_justification: true # Should explain why NAT is needed
+
+# General Resource Policies
+general:
+  # Tagging
+  always_tag_managed_by: true # Always add 'ManagedBy: AIAgent' tag
+
+  # Cost tracking
+  estimate_costs: true # Always estimate costs before creating resources
+
+  # Approval thresholds
+  require_confirmation_above_cost: 10.0 # Hourly cost in USD
+
+  # Cleanup
+  auto_tag_creation_date: true # Add creation timestamp for cleanup

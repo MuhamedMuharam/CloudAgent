@@ -35,12 +35,20 @@ def main():
     if args.sync:
         print("🔄 Syncing state from AWS...\n")
         try:
-            from cloud_providers.aws import EC2Manager
+            from cloud_providers.aws import EC2Manager, VPCManager, SecurityGroupManager
             from dotenv import load_dotenv
             load_dotenv()
             
-            ec2_manager = EC2Manager(region=os.getenv('AWS_REGION', 'us-east-1'))
-            state_manager.sync_from_aws(ec2_manager)
+            region = os.getenv('AWS_REGION', 'us-east-1')
+            ec2_manager = EC2Manager(region=region)
+            vpc_manager = VPCManager(region=region)
+            security_manager = SecurityGroupManager(region=region)
+            
+            state_manager.sync_from_aws(
+                ec2_manager=ec2_manager,
+                vpc_manager=vpc_manager,
+                security_manager=security_manager
+            )
             print()
         except Exception as e:
             print(f"⚠️  Could not sync from AWS: {e}\n")

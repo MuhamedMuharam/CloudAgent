@@ -140,9 +140,13 @@ class StateManager:
             "initialized_at": datetime.now().isoformat(),  # When state tracking started
             "last_updated": datetime.now().isoformat(),  # Last modification time
             "providers": {
-                # AWS infrastructure state
+                # AWS infrastructure state (hierarchical organization)
                 "aws": {
-                    "ec2_instances": [],  # List of EC2 instances
+                    "vpcs": [],  # List of VPCs, each containing subnets with instances, and security groups
+                    "orphaned_resources": {
+                        "instances": [],  # EC2 instances not in any VPC
+                        "security_groups": []  # Security groups not in any VPC
+                    },
                     "last_sync": None  # Last sync with AWS API
                 },
                 # Azure infrastructure state (future)
@@ -252,22 +256,84 @@ class StateManager:
         with open(self.state_file, 'w') as f:
             json.dump(state, f, indent=2, default=str)
     
-    def update_aws_ec2_state(self, instances: List[Dict]):
+    def update_aws_hierarchical_state(self, vpcs: List[Dict], instances: List[Dict], security_groups: List[Dict]):
         """
-        Update the tracked state of AWS EC2 instances.
+        Update AWS state with hierarchical organization.
+        Organizes resources as: VPCs → Subnets → EC2 Instances, and VPCs → Security Groups
         
         Args:
+            vpcs: List of VPC dictionaries from VPCManager.list_vpcs()
             instances: List of instance dictionaries from EC2Manager.list_instances()
+            security_groups: List of SG dictionaries from SecurityGroupManager.list_security_groups()
         """
         state = self._load_state()
-        state["providers"]["aws"]["ec2_instances"] = instances
+        
+        # Build hierarchical structure
+        organized_vpcs = []
+        orphaned_instances = []
+        orphaned_sgs = []
+        
+        # Process each VPC
+        for vpc in vpcs:
+            vpc_id = vpc['vpc_id']
+            
+            # Find security groups for this VPC
+            vpc_security_groups = [
+                sg for sg in security_groups 
+                if sg.get('vpc_id') == vpc_id
+            ]
+            
+            # Process each subnet in the VPC
+            enriched_subnets = []
+            for subnet in vpc.get('subnets', []):
+                subnet_id = subnet['subnet_id']
+                
+                # Find instances in this subnet
+                subnet_instances = [
+                    inst for inst in instances
+                    if inst.get('subnet_id') == subnet_id
+                ]
+                
+                # Add instances to subnet
+                enriched_subnet = subnet.copy()
+                enriched_subnet['instances'] = subnet_instances
+                enriched_subnets.append(enriched_subnet)
+            
+            # Build enriched VPC structure
+            enriched_vpc = vpc.copy()
+            enriched_vpc['subnets'] = enriched_subnets
+            enriched_vpc['security_groups'] = vpc_security_groups
+            organized_vpcs.append(enriched_vpc)
+        
+        # Find orphaned instances (no subnet/VPC or VPC not in our list)
+        vpc_ids = {vpc['vpc_id'] for vpc in vpcs}
+        for inst in instances:
+            if inst.get('vpc_id') == 'N/A' or inst.get('vpc_id') not in vpc_ids:
+                orphaned_instances.append(inst)
+        
+        # Find orphaned security groups (no VPC or VPC not in our list)
+        for sg in security_groups:
+            if sg.get('vpc_id') == 'N/A' or sg.get('vpc_id') not in vpc_ids:
+                orphaned_sgs.append(sg)
+        
+        # Update state
+        state["providers"]["aws"]["vpcs"] = organized_vpcs
+        state["providers"]["aws"]["orphaned_resources"] = {
+            "instances": orphaned_instances,
+            "security_groups": orphaned_sgs
+        }
         state["providers"]["aws"]["last_sync"] = datetime.now().isoformat()
         self._save_state(state)
     
-    def get_aws_ec2_state(self) -> List[Dict]:
-        """Get last known AWS EC2 instance state."""
+    def get_aws_vpc_state(self) -> List[Dict]:
+        """Get hierarchically organized AWS VPC state."""
         state = self._load_state()
-        return state.get("providers", {}).get("aws", {}).get("ec2_instances", [])
+        return state.get("providers", {}).get("aws", {}).get("vpcs", [])
+    
+    def get_aws_orphaned_resources(self) -> Dict:
+        """Get orphaned AWS resources (not in any VPC)."""
+        state = self._load_state()
+        return state.get("providers", {}).get("aws", {}).get("orphaned_resources", {"instances": [], "security_groups": []})
     
     def log_action(self, action_type: str, details: Dict, success: bool = True, error: str = None):
         """
@@ -459,22 +525,114 @@ class StateManager:
             f"  - Total Resources Created: {stats.get('total_resources_created', 0)}",
             f"  - Total Resources Deleted: {stats.get('total_resources_deleted', 0)}",
             "",
-            "☁️  AWS EC2 Instances:",
+            "🌐 AWS Infrastructure (Hierarchical View):",
         ]
         
-        aws_instances = state.get("providers", {}).get("aws", {}).get("ec2_instances", [])
-        if aws_instances:
-            for inst in aws_instances:
+        aws_vpcs = state.get("providers", {}).get("aws", {}).get("vpcs", [])
+        if aws_vpcs:
+            for vpc in aws_vpcs:
+                igw_count = len(vpc.get('internet_gateways', []))
+                nat_count = len(vpc.get('nat_gateways', []))
+                sg_count = len(vpc.get('security_groups', []))
+                rt_count = len(vpc.get('route_tables', []))
+                
+                report_lines.append(f"")
                 report_lines.append(
-                    f"  - {inst.get('name', 'N/A')} ({inst.get('id', 'N/A')}): "
-                    f"{inst.get('state', 'unknown')} - {inst.get('type', 'unknown')}"
+                    f"  📦 VPC: {vpc.get('name', 'N/A')} ({vpc.get('vpc_id', 'N/A')}) "
+                    f"[{vpc.get('state', 'unknown')}]"
                 )
+                report_lines.append(f"      CIDR: {vpc.get('cidr_block', 'N/A')}")
+                report_lines.append(f"      Networking: {igw_count} IGW, {nat_count} NAT, {rt_count} Route Tables, {sg_count} SGs")
+                
+                # Show route tables
+                route_tables = vpc.get('route_tables', [])
+                if route_tables:
+                    report_lines.append(f"      Route Tables ({len(route_tables)}):")
+                    for rt in route_tables:
+                        main_tag = " [MAIN]" if rt.get('is_main', False) else ""
+                        assoc_count = len(rt.get('associated_subnets', []))
+                        report_lines.append(
+                            f"        └─ {rt.get('name', 'N/A')} ({rt.get('route_table_id', 'N/A')}){main_tag}"
+                        )
+                        # Show key routes (non-local)
+                        for route in rt.get('routes', [])[:3]:  # Show first 3 routes
+                            if route.get('target') != 'local':
+                                report_lines.append(f"           ├─ {route['destination']} → {route['target']}")
+                        if assoc_count > 0:
+                            report_lines.append(f"           └─ {assoc_count} associated subnets")
+                
+                # Show subnets and their instances
+                subnets = vpc.get('subnets', [])
+                if subnets:
+                    report_lines.append(f"      Subnets ({len(subnets)}):")
+                    for subnet in subnets:
+                        subnet_type = "Public" if subnet.get('map_public_ip_on_launch', False) else "Private"
+                        instances = subnet.get('instances', [])
+                        report_lines.append(
+                            f"        └─ {subnet.get('name', 'N/A')} ({subnet.get('subnet_id', 'N/A')}) "
+                            f"[{subnet_type}] - {subnet.get('cidr_block', 'N/A')}"
+                        )
+                        
+                        # Show instances in this subnet
+                        if instances:
+                            for inst in instances:
+                                state_marker = "🟢" if inst.get('state') == 'running' else "🔴" if inst.get('state') == 'stopped' else "⚪"
+                                report_lines.append(
+                                    f"           {state_marker} {inst.get('name', 'N/A')} ({inst.get('id', 'N/A')}) "
+                                    f"- {inst.get('type', 'N/A')} [{inst.get('state', 'unknown')}]"
+                                )
+                        else:
+                            report_lines.append(f"           (No instances)")
+                
+                # Show security groups for this VPC
+                sgs = vpc.get('security_groups', [])
+                if sgs:
+                    # Only show AI-managed SGs for cleaner output
+                    managed_sgs = [sg for sg in sgs if any(
+                        tag.get('Key') == 'ManagedBy' and tag.get('Value') == 'AIAgent'
+                        for tag in sg.get('Tags', [])
+                    )]
+                    
+                    if managed_sgs:
+                        report_lines.append(f"      Security Groups (AI-Managed):")
+                        for sg in managed_sgs:
+                            ingress_count = len(sg.get('ingress_rules', []))
+                            egress_count = len(sg.get('egress_rules', []))
+                            report_lines.append(
+                                f"        🔒 {sg.get('name', 'N/A')} ({sg.get('security_group_id', 'N/A')}) "
+                                f"- {ingress_count} in, {egress_count} out"
+                            )
         else:
-            report_lines.append("  (No instances tracked)")
+            report_lines.append("  (No VPCs tracked)")
+        
+        # Show orphaned resources
+        orphaned = state.get("providers", {}).get("aws", {}).get("orphaned_resources", {})
+        orphaned_instances = orphaned.get('instances', [])
+        orphaned_sgs = orphaned.get('security_groups', [])
+        
+        if orphaned_instances or orphaned_sgs:
+            report_lines.append("")
+            report_lines.append("  ⚠️  Orphaned Resources (not in any VPC):")
+            
+            if orphaned_instances:
+                report_lines.append(f"      Instances ({len(orphaned_instances)}):")
+                for inst in orphaned_instances:
+                    report_lines.append(
+                        f"        - {inst.get('name', 'N/A')} ({inst.get('id', 'N/A')}) "
+                        f"- {inst.get('type', 'N/A')} [{inst.get('state', 'unknown')}]"
+                    )
+            
+            if orphaned_sgs:
+                report_lines.append(f"      Security Groups ({len(orphaned_sgs)}):")
+                for sg in orphaned_sgs[:3]:  # Show first 3
+                    report_lines.append(f"        - {sg.get('name', 'N/A')} ({sg.get('security_group_id', 'N/A')})")
+                if len(orphaned_sgs) > 3:
+                    report_lines.append(f"        ... and {len(orphaned_sgs) - 3} more")
         
         aws_last_sync = state.get("providers", {}).get("aws", {}).get("last_sync")
         if aws_last_sync:
-            report_lines.append(f"  Last synced: {aws_last_sync}")
+            report_lines.append("")
+            report_lines.append(f"  ⏱️  Last AWS sync: {aws_last_sync}")
         
         report_lines.append("")
         report_lines.append("📝 Recent Actions (last 5):")
@@ -493,20 +651,44 @@ class StateManager:
         
         return "\n".join(report_lines)
     
-    def sync_from_aws(self, ec2_manager):
+    def sync_from_aws(self, ec2_manager=None, vpc_manager=None, security_manager=None):
         """
-        Sync state from AWS (pull current reality).
+        Sync state from AWS and organize hierarchically.
         
         Args:
             ec2_manager: EC2Manager instance to query
+            vpc_manager: VPCManager instance to query
+            security_manager: SecurityGroupManager instance to query
         """
-        print("🔄 Syncing state from AWS...")
-        instances = ec2_manager.list_instances()
-        self.update_aws_ec2_state(instances)
-        print(f"✅ Synced {len(instances)} EC2 instances from AWS")
+        instances = []
+        vpcs = []
+        security_groups = []
+        
+        if vpc_manager:
+            print("🔄 Syncing VPCs from AWS...")
+            vpcs = vpc_manager.list_vpcs()
+            print(f"✅ Synced {len(vpcs)} VPCs")
+        
+        if ec2_manager:
+            print("🔄 Syncing EC2 instances from AWS...")
+            instances = ec2_manager.list_instances()
+            print(f"✅ Synced {len(instances)} EC2 instances")
+        
+        if security_manager:
+            print("🔄 Syncing Security Groups from AWS...")
+            security_groups = security_manager.list_security_groups()
+            print(f"✅ Synced {len(security_groups)} Security Groups")
+        
+        # Organize hierarchically
+        print("📊 Organizing resources hierarchically...")
+        self.update_aws_hierarchical_state(vpcs, instances, security_groups)
         
         self.log_action(
             action_type="sync_from_aws",
-            details={"instance_count": len(instances)},
+            details={
+                "vpcs": len(vpcs),
+                "instances": len(instances),
+                "security_groups": len(security_groups)
+            },
             success=True
         )

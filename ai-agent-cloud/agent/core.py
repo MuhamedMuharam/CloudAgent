@@ -17,6 +17,7 @@ from dotenv import load_dotenv  # Load .env file with credentials
 from openai import OpenAI  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
 from .state_manager import StateManager  # State tracking and audit logs
+from .policy_engine import PolicyEngine, PolicyViolation  # Policy validation
 
 # Load environment variables from .env file
 # This loads: OPENAI_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
@@ -67,6 +68,10 @@ async def run_agent(goal: str, mcp_servers: list = None):
     # Initialize state manager for audit logging
     # Tracks all actions to state.json and audit_log.jsonl
     state_manager = StateManager()
+    
+    # Initialize policy engine for safety validation
+    # Validates all actions against security and compliance policies
+    policy_engine = PolicyEngine()
     
     # ═══════════════════════════════════════════════════════════════
     # STEP 2: Configure MCP Servers
@@ -135,12 +140,26 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 "role": "system",
                 "content": (
                     "You are an autonomous cloud infrastructure agent. "
-                    "You manage cloud resources (EC2 instances, VMs) using available tools. "
+                    "You manage cloud resources (EC2 instances, VMs, VPCs, Security Groups) using available tools. "
                     "Think step-by-step and call tools when needed. "
-                    "Make decisions independently without asking the user. "
-                    "For cost efficiency, prefer t3.micro instances (1 CPU, 1GB RAM) as they are free-tier eligible. "
-                    "Only use larger instances if specifically requested by the user. "
-                    "When creating instances without specific requirements, use t3.micro to minimize costs. "
+                    "Make decisions independently without asking the user. \n\n"
+                    
+                    "COST EFFICIENCY:\n"
+                    "- Prefer t3.micro instances (1 CPU, 1GB RAM) as they are free-tier eligible\n"
+                    "- Only use larger instances if specifically requested\n\n"
+                    
+                    "SECURITY GROUP RULES - IMPORTANT:\n"
+                    "When creating security group rules, you MUST choose the correct source type:\n"
+                    "1. For IP-based access: Use 'cidr' parameter\n"
+                    "   Example: {'type': 'ingress', 'protocol': 'tcp', 'port': 80, 'cidr': '0.0.0.0/0'}\n\n"
+                    
+                    "2. For security-group-to-security-group access: Use 'source_security_group_id' parameter\n"
+                    "   - First, look up the source security group ID using aws_list_security_groups\n"
+                    "   - Then use that ID in the rule\n"
+                    "   Example: {'type': 'ingress', 'protocol': 'tcp', 'port': 8080, 'source_security_group_id': 'sg-abc123'}\n\n"
+                    
+                    "NEVER use a security group name as a CIDR block. Always get the security group ID first.\n\n"
+                    
                     "Complete tasks immediately and report what you did."
                 )
             },
@@ -152,7 +171,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         
         # Main agent loop
         iteration = 0
-        max_iterations = 3  # Prevent infinite loops (reduced to avoid retries on transient errors)
+        max_iterations = 5  # Prevent infinite loops (reduced to avoid retries on transient errors)
         actions_taken = []  # Track actions for this goal
         
         while iteration < max_iterations:
@@ -181,7 +200,36 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     print(f"   Arguments: {json.dumps(args, indent=6)}")
                     
                     try:
-                        # Execute tool via MCP
+                        # STEP 1: Validate action against policies (BEFORE execution)
+                        try:
+                            policy_engine.validate_action(tool_name, args)
+                        except PolicyViolation as e:
+                            # Policy violation - don't execute the tool
+                            print(f"❌ POLICY VIOLATION: {e}")
+                            
+                            # Return error to GPT so it knows and can try alternative
+                            error_result = json.dumps({
+                                "success": False,
+                                "error": f"Policy violation: {str(e)}"
+                            })
+                            
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": error_result
+                            })
+                            
+                            # Log the blocked action
+                            state_manager.log_action(
+                                action_type=f"{tool_name}_blocked",
+                                details={"args": args, "reason": str(e)},
+                                success=False,
+                                error=f"Policy violation: {str(e)}"
+                            )
+                            
+                            continue  # Skip to next tool call
+                        
+                        # STEP 2: Execute tool via MCP (only if policy allows)
                         result = await mcp_client.call_tool(tool_name, args)
                         
                         print(f"📊 Tool Result:")

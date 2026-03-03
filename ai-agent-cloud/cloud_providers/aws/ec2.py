@@ -67,6 +67,8 @@ class EC2Manager:
                         'launch_time': instance.get('LaunchTime', 'N/A'),
                         'public_ip': instance.get('PublicIpAddress', 'N/A'),
                         'private_ip': instance.get('PrivateIpAddress', 'N/A'),
+                        'vpc_id': instance.get('VpcId', 'N/A'),
+                        'subnet_id': instance.get('SubnetId', 'N/A'),
                         'tags': tags  # Include tags for reference
                     })
             

@@ -1,6 +1,7 @@
 # Core dependencies for AI Agent Cloud Infrastructure
 openai
 python-dotenv
+pyyaml  # For policy engine configuration
 
 # FastMCP (includes MCP SDK as dependency)
 fastmcp
