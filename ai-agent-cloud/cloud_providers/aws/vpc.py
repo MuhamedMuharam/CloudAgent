@@ -501,46 +501,191 @@ class VPCManager:
         Delete a VPC and optionally all its dependencies.
         
         Args:
-            vpc_id: VPC ID to delete
+            vpc_id: VPC ID (vpc-xxx) or VPC name to delete
             force: If True, delete all dependencies first
         
         Returns:
             Dictionary with deletion status
         """
+        import time
+        
         try:
+            # Support VPC lookup by name if not a VPC ID
+            if not vpc_id.startswith('vpc-'):
+                print(f"[INFO] Looking up VPC by name: {vpc_id}", file=sys.stderr)
+                vpcs = self.ec2_client.describe_vpcs(
+                    Filters=[{'Name': 'tag:Name', 'Values': [vpc_id]}]
+                )
+                if not vpcs['Vpcs']:
+                    raise Exception(f"VPC with name '{vpc_id}' not found")
+                vpc_id = vpcs['Vpcs'][0]['VpcId']
+                print(f"[INFO] Found VPC ID: {vpc_id}", file=sys.stderr)
+            
             vpc = self.ec2_resource.Vpc(vpc_id)
             
             if force:
-                # Delete all dependencies
+                # Delete all dependencies in the correct order
                 print(f"[INFO] Force deleting VPC {vpc_id} and all dependencies...", file=sys.stderr)
                 
-                # Delete NAT Gateways
+                # Step 1: Terminate EC2 instances in the VPC
+                print(f"[INFO] Checking for EC2 instances in VPC...", file=sys.stderr)
+                instances = self.ec2_client.describe_instances(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )
+                instance_ids = []
+                for reservation in instances['Reservations']:
+                    for instance in reservation['Instances']:
+                        if instance['State']['Name'] not in ['terminated', 'terminating']:
+                            instance_ids.append(instance['InstanceId'])
+                
+                if instance_ids:
+                    print(f"[INFO] Terminating {len(instance_ids)} instances: {instance_ids}", file=sys.stderr)
+                    self.ec2_client.terminate_instances(InstanceIds=instance_ids)
+                    
+                    # Wait for instances to terminate
+                    print(f"[INFO] Waiting for instances to terminate...", file=sys.stderr)
+                    waiter = self.ec2_client.get_waiter('instance_terminated')
+                    try:
+                        waiter.wait(InstanceIds=instance_ids, WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
+                    except Exception as e:
+                        print(f"[WARNING] Timeout waiting for instances to terminate: {e}", file=sys.stderr)
+                
+                # Step 2: Disassociate route tables from subnets (CRITICAL: must do this first!)
+                print(f"[INFO] Disassociating route tables from subnets...", file=sys.stderr)
+                for rt in vpc.route_tables.all():
+                    # Check if this is a custom route table (not main)
+                    is_main = any(assoc.get('Main', False) for assoc in rt.associations_attribute or [])
+                    if not is_main:
+                        # Disassociate from all subnets
+                        for assoc in rt.associations_attribute or []:
+                            if 'SubnetId' in assoc:
+                                assoc_id = assoc['RouteTableAssociationId']
+                                print(f"[INFO] Disassociating route table {rt.id} from subnet", file=sys.stderr)
+                                try:
+                                    self.ec2_client.disassociate_route_table(AssociationId=assoc_id)
+                                except ClientError as e:
+                                    print(f"[WARNING] Error disassociating route table: {e}", file=sys.stderr)
+                
+                # Step 3: Delete NAT Gateways and WAIT for them to be deleted
                 nat_gateways = self.ec2_client.describe_nat_gateways(
                     Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
                 )
-                for nat in nat_gateways['NatGateways']:
-                    if nat['State'] != 'deleted':
-                        print(f"[INFO] Deleting NAT Gateway {nat['NatGatewayId']}", file=sys.stderr)
-                        self.ec2_client.delete_nat_gateway(NatGatewayId=nat['NatGatewayId'])
+                nat_gateway_ids = []
+                elastic_ips = []
                 
-                # Delete subnets
+                for nat in nat_gateways['NatGateways']:
+                    if nat['State'] not in ['deleted', 'deleting']:
+                        nat_id = nat['NatGatewayId']
+                        nat_gateway_ids.append(nat_id)
+                        
+                        # Save Elastic IP allocation IDs for later cleanup
+                        for addr in nat.get('NatGatewayAddresses', []):
+                            if 'AllocationId' in addr:
+                                elastic_ips.append(addr['AllocationId'])
+                        
+                        print(f"[INFO] Deleting NAT Gateway {nat_id}", file=sys.stderr)
+                        self.ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+                
+                # Wait for NAT Gateways to be fully deleted (critical!)
+                if nat_gateway_ids:
+                    print(f"[INFO] Waiting for {len(nat_gateway_ids)} NAT Gateway(s) to be deleted...", file=sys.stderr)
+                    for nat_id in nat_gateway_ids:
+                        max_attempts = 60  # 5 minutes (5 seconds * 60)
+                        attempt = 0
+                        while attempt < max_attempts:
+                            try:
+                                response = self.ec2_client.describe_nat_gateways(NatGatewayIds=[nat_id])
+                                state = response['NatGateways'][0]['State']
+                                if state == 'deleted':
+                                    print(f"[INFO] NAT Gateway {nat_id} deleted successfully", file=sys.stderr)
+                                    break
+                                print(f"[INFO] NAT Gateway {nat_id} state: {state}, waiting...", file=sys.stderr)
+                            except ClientError as e:
+                                if 'does not exist' in str(e):
+                                    break
+                            time.sleep(5)
+                            attempt += 1
+                        
+                        if attempt >= max_attempts:
+                            print(f"[WARNING] Timeout waiting for NAT Gateway {nat_id} to delete", file=sys.stderr)
+                
+                # Step 4: Release Elastic IPs and wait for them to be fully released
+                for eip_id in elastic_ips:
+                    try:
+                        print(f"[INFO] Releasing Elastic IP {eip_id}", file=sys.stderr)
+                        self.ec2_client.release_address(AllocationId=eip_id)
+                    except ClientError as e:
+                        print(f"[WARNING] Could not release Elastic IP {eip_id}: {e}", file=sys.stderr)
+                
+                # Give time for Elastic IPs to be fully released before IGW detachment
+                if elastic_ips:
+                    print(f"[INFO] Waiting 30 seconds for Elastic IPs to be fully released...", file=sys.stderr)
+                    time.sleep(30)
+                
+                # Step 5: Delete network interfaces (ENIs) that are not attached to instances
+                print(f"[INFO] Checking for network interfaces in VPC...", file=sys.stderr)
+                enis = self.ec2_client.describe_network_interfaces(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )
+                for eni in enis['NetworkInterfaces']:
+                    eni_id = eni['NetworkInterfaceId']
+                    # Only delete ENIs not attached to instances (interface type: interface)
+                    if eni.get('Attachment') is None or eni.get('Status') == 'available':
+                        try:
+                            print(f"[INFO] Deleting network interface {eni_id}", file=sys.stderr)
+                            self.ec2_client.delete_network_interface(NetworkInterfaceId=eni_id)
+                        except ClientError as e:
+                            print(f"[WARNING] Could not delete ENI {eni_id}: {e}", file=sys.stderr)
+                
+                # Step 6: Detach and delete Internet Gateways (with retry logic)
+                for igw in vpc.internet_gateways.all():
+                    print(f"[INFO] Detaching and deleting Internet Gateway {igw.id}", file=sys.stderr)
+                    
+                    # Retry IGW detachment (in case Elastic IPs are still releasing)
+                    max_retry = 10
+                    for retry in range(max_retry):
+                        try:
+                            igw.detach_from_vpc(VpcId=vpc_id)
+                            igw.delete()
+                            print(f"[SUCCESS] IGW {igw.id} deleted", file=sys.stderr)
+                            break
+                        except ClientError as e:
+                            if 'mapped public address' in str(e) and retry < max_retry - 1:
+                                print(f"[INFO] IGW still has mapped addresses, waiting... (attempt {retry+1}/{max_retry})", file=sys.stderr)
+                                time.sleep(10)
+                            else:
+                                print(f"[WARNING] Error deleting IGW {igw.id}: {e}", file=sys.stderr)
+                                break
+                
+                # Step 7: Delete custom route tables (not main) - now safe after disassociation
+                for rt in vpc.route_tables.all():
+                    # Skip main route table
+                    is_main = any(assoc.get('Main', False) for assoc in rt.associations_attribute or [])
+                    if not is_main:
+                        print(f"[INFO] Deleting route table {rt.id}", file=sys.stderr)
+                        try:
+                            rt.delete()
+                        except ClientError as e:
+                            print(f"[WARNING] Error deleting route table {rt.id}: {e}", file=sys.stderr)
+                
+                # Step 8: Delete subnets - now safe after route table disassociation
                 for subnet in vpc.subnets.all():
                     print(f"[INFO] Deleting subnet {subnet.id}", file=sys.stderr)
-                    subnet.delete()
+                    try:
+                        subnet.delete()
+                    except ClientError as e:
+                        print(f"[WARNING] Error deleting subnet {subnet.id}: {e}", file=sys.stderr)
                 
-                # Detach and delete Internet Gateways
-                for igw in vpc.internet_gateways.all():
-                    print(f"[INFO] Detaching and deleting IGW {igw.id}", file=sys.stderr)
-                    igw.detach_from_vpc(VpcId=vpc_id)
-                    igw.delete()
-                
-                # Delete route tables (except main)
-                for rt in vpc.route_tables.all():
-                    if not any(assoc.get('Main') for assoc in rt.associations_attribute or []):
-                        print(f"[INFO] Deleting route table {rt.id}", file=sys.stderr)
-                        rt.delete()
+                # Step 9: Delete security groups (except default)
+                for sg in vpc.security_groups.all():
+                    if sg.group_name != 'default':
+                        print(f"[INFO] Deleting security group {sg.id}", file=sys.stderr)
+                        try:
+                            sg.delete()
+                        except ClientError as e:
+                            print(f"[WARNING] Error deleting security group {sg.id}: {e}", file=sys.stderr)
             
-            # Delete VPC
+            # Step 10: Delete VPC
             vpc.delete()
             
             print(f"[SUCCESS] Deleted VPC {vpc_id}", file=sys.stderr)
@@ -552,5 +697,123 @@ class VPCManager:
         
         except ClientError as e:
             error_msg = f"Failed to delete VPC: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)    
+    def delete_subnet(self, subnet_id: str) -> Dict:
+        """
+        Delete a subnet.
+        
+        Args:
+            subnet_id: Subnet ID to delete
+        
+        Returns:
+            Dictionary with deletion status
+        """
+        try:
+            subnet = self.ec2_resource.Subnet(subnet_id)
+            subnet.delete()
+            
+            print(f"[SUCCESS] Deleted subnet {subnet_id}", file=sys.stderr)
+            
+            return {
+                'subnet_id': subnet_id,
+                'status': 'deleted'
+            }
+        
+        except ClientError as e:
+            error_msg = f"Failed to delete subnet: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+    
+    def delete_internet_gateway(self, igw_id: str, vpc_id: Optional[str] = None) -> Dict:
+        """
+        Detach and delete an Internet Gateway.
+        
+        Args:
+            igw_id: Internet Gateway ID to delete
+            vpc_id: Optional VPC ID to detach from
+        
+        Returns:
+            Dictionary with deletion status
+        """
+        try:
+            igw = self.ec2_resource.InternetGateway(igw_id)
+            
+            # If vpc_id not provided, find it from attachments
+            if not vpc_id:
+                attachments = igw.attachments
+                if attachments:
+                    vpc_id = attachments[0]['VpcId']
+            
+            # Detach from VPC
+            if vpc_id:
+                igw.detach_from_vpc(VpcId=vpc_id)
+                print(f"[INFO] Detached IGW {igw_id} from VPC {vpc_id}", file=sys.stderr)
+            
+            # Delete IGW
+            igw.delete()
+            
+            print(f"[SUCCESS] Deleted Internet Gateway {igw_id}", file=sys.stderr)
+            
+            return {
+                'internet_gateway_id': igw_id,
+                'status': 'deleted'
+            }
+        
+        except ClientError as e:
+            error_msg = f"Failed to delete Internet Gateway: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+    
+    def delete_nat_gateway(self, nat_gateway_id: str) -> Dict:
+        """
+        Delete a NAT Gateway.
+        Note: This is an asynchronous operation and can take several minutes.
+        
+        Args:
+            nat_gateway_id: NAT Gateway ID to delete
+        
+        Returns:
+            Dictionary with deletion status
+        """
+        try:
+            response = self.ec2_client.delete_nat_gateway(NatGatewayId=nat_gateway_id)
+            
+            print(f"[SUCCESS] NAT Gateway {nat_gateway_id} deletion initiated", file=sys.stderr)
+            
+            return {
+                'nat_gateway_id': nat_gateway_id,
+                'status': 'deleting',
+                'response': response
+            }
+        
+        except ClientError as e:
+            error_msg = f"Failed to delete NAT Gateway: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+    
+    def delete_route_table(self, route_table_id: str) -> Dict:
+        """
+        Delete a route table.
+        
+        Args:
+            route_table_id: Route table ID to delete
+        
+        Returns:
+            Dictionary with deletion status
+        """
+        try:
+            route_table = self.ec2_resource.RouteTable(route_table_id)
+            route_table.delete()
+            
+            print(f"[SUCCESS] Deleted route table {route_table_id}", file=sys.stderr)
+            
+            return {
+                'route_table_id': route_table_id,
+                'status': 'deleted'
+            }
+        
+        except ClientError as e:
+            error_msg = f"Failed to delete route table: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)

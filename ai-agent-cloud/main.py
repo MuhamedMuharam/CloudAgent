@@ -65,23 +65,25 @@ if __name__ == "__main__":
     # The agent will use GPT-4 to reason about how to achieve this goal
     # It will then call MCP tools (via AWS server) to take actions
     
-    goal = """
-    Create a production VPC infrastructure:
+   #  goal = """
+   #  Create a production VPC infrastructure:
     
-    1. Create a VPC with CIDR 10.0.0.0/16 named 'test-vpc'
-    2. Create 2 public subnets:
-       - Public subnet 1: 10.0.1.0/24 in us-east-1a
-       - Public subnet 2: 10.0.2.0/24 in us-east-1b
-    3. Create 2 private subnets:
-       - Private subnet 1: 10.0.10.0/24 in us-east-1a
-       - Private subnet 2: 10.0.11.0/24 in us-east-1b
-    4. Create an Internet Gateway and attach it to the VPC
-    5. Create a NAT Gateway in the first public subnet
-    6. Create route tables:
-       - Public route table with route to Internet Gateway (0.0.0.0/0 -> IGW)
-       - Private route table with route to NAT Gateway (0.0.0.0/0 -> NAT)
-    7. Associate route tables with appropriate subnets
-    """
+   #  1. Create a VPC with CIDR 10.0.0.0/16 named 'test2-vpc'
+   #  2. Create 2 public subnets:
+   #     - Public subnet 1: 10.0.1.0/24 in us-east-1a , name it 'test2-public-subnet-1'
+   #     - Public subnet 2: 10.0.2.0/24 in us-east-1b, name it 'test2-public-subnet-2'
+   #  3. Create 2 private subnets:
+   #     - Private subnet 1: 10.0.10.0/24 in us-east-1a , name it 'test2-private-subnet-1'
+   #     - Private subnet 2: 10.0.11.0/24 in us-east-1b , name it 'test2-private-subnet-2'
+   #  4. Create an Internet Gateway and attach it to the VPC , name it 'test2-igw'
+   #  5. Create a NAT Gateway in the first public subnet , name it 'test2-nat-gateway'
+   #  6. Create route tables:
+   #     - Public route table with route to Internet Gateway (0.0.0.0/0 -> IGW)
+   #     - Private route table with route to NAT Gateway (0.0.0.0/0 -> NAT)
+   #  7. Associate route tables with appropriate subnets
+   #  """
+    goal = """
+     Delete VPC called 'test2-vpc' and all associated resources (subnets, gateways, route tables)."""
     # You can also test other goals:
    
     

@@ -464,8 +464,16 @@ async def aws_delete_vpc(vpc_id: str, force: bool = False) -> dict:
     Delete a VPC and optionally all its dependencies.
     
     Args:
-        vpc_id: VPC ID to delete
-        force: If True, delete all subnets, IGWs, NAT gateways, etc. first
+        vpc_id: VPC ID (vpc-xxx) or VPC name to delete
+        force: If True, automatically delete all dependencies in the correct order:
+               - Terminate EC2 instances
+               - Disassociate and delete route tables
+               - Delete NAT Gateways (waits for full deletion)
+               - Release Elastic IPs
+               - Detach and delete Internet Gateways
+               - Delete subnets
+               - Delete security groups
+               - Delete VPC
     
     Returns:
         Dictionary with deletion status
@@ -474,7 +482,111 @@ async def aws_delete_vpc(vpc_id: str, force: bool = False) -> dict:
         result = vpc_manager.delete_vpc(vpc_id, force)
         return {
             "success": True,
-            "message": f"VPC {vpc_id} deleted successfully",
+            "message": f"VPC deleted successfully",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_delete_subnet(subnet_id: str) -> dict:
+    """
+    Delete a subnet.
+    Note: Subnet must not have any dependencies (instances, ENIs, etc.).
+    
+    Args:
+        subnet_id: Subnet ID to delete
+    
+    Returns:
+        Dictionary with deletion status
+    """
+    try:
+        result = vpc_manager.delete_subnet(subnet_id)
+        return {
+            "success": True,
+            "message": f"Subnet {subnet_id} deleted successfully",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_delete_internet_gateway(igw_id: str, vpc_id: str = None) -> dict:
+    """
+    Detach and delete an Internet Gateway.
+    
+    Args:
+        igw_id: Internet Gateway ID to delete
+        vpc_id: Optional VPC ID to detach from (if not provided, will detect automatically)
+    
+    Returns:
+        Dictionary with deletion status
+    """
+    try:
+        result = vpc_manager.delete_internet_gateway(igw_id, vpc_id)
+        return {
+            "success": True,
+            "message": f"Internet Gateway {igw_id} deleted successfully",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_delete_nat_gateway(nat_gateway_id: str) -> dict:
+    """
+    Delete a NAT Gateway.
+    Note: NAT Gateway deletion is asynchronous and can take several minutes.
+    
+    Args:
+        nat_gateway_id: NAT Gateway ID to delete
+    
+    Returns:
+        Dictionary with deletion status
+    """
+    try:
+        result = vpc_manager.delete_nat_gateway(nat_gateway_id)
+        return {
+            "success": True,
+            "message": f"NAT Gateway {nat_gateway_id} deletion initiated",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_delete_route_table(route_table_id: str) -> dict:
+    """
+    Delete a route table.
+    Note: Cannot delete the main route table or route tables with subnet associations.
+    
+    Args:
+        route_table_id: Route table ID to delete
+    
+    Returns:
+        Dictionary with deletion status
+    """
+    try:
+        result = vpc_manager.delete_route_table(route_table_id)
+        return {
+            "success": True,
+            "message": f"Route table {route_table_id} deleted successfully",
             "details": result
         }
     except Exception as e:

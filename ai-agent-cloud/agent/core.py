@@ -160,6 +160,23 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     
                     "NEVER use a security group name as a CIDR block. Always get the security group ID first.\n\n"
                     
+                    "VPC DELETION - CRITICAL:\n"
+                    "When deleting a VPC, ALWAYS use force=true with aws_delete_vpc.\n"
+                    "- You can pass either VPC ID (vpc-xxx) OR VPC name to aws_delete_vpc\n"
+                    "- With force=true, the tool automatically handles ALL dependencies in the correct order:\n"
+                    "  1. Terminates EC2 instances and waits for termination\n"
+                    "  2. Disassociates route tables from subnets\n"
+                    "  3. Deletes NAT Gateways and waits ~5 minutes for full deletion\n"
+                    "  4. Releases Elastic IPs and waits for propagation\n"
+                    "  5. Detaches and deletes Internet Gateways (with retry logic)\n"
+                    "  6. Deletes route tables\n"
+                    "  7. Deletes subnets\n"
+                    "  8. Deletes security groups\n"
+                    "  9. Deletes the VPC\n"
+                    "- DO NOT manually delete individual components (subnets, IGWs, NAT gateways, etc.)\n"
+                    "- Simply call: aws_delete_vpc with vpc_id='vpc-name-or-id' and force=true\n"
+                    "- The tool handles all complexity and wait times automatically\n\n"
+                    
                     "Complete tasks immediately and report what you did."
                 )
             },
