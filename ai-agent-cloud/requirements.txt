@@ -10,6 +10,9 @@ fastmcp
 boto3
 botocore
 
+# Demo workload service for observability testing
+flask
+
 # Future cloud providers (not yet implemented)
 # azure-identity
 # azure-mgmt-compute

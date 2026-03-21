@@ -9,6 +9,7 @@ Run this server with: python mcp_servers/aws_server.py
 """
 
 import asyncio
+import json
 import os
 import sys
 
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from cloud_providers.aws.ec2 import EC2Manager
 from cloud_providers.aws.vpc import VPCManager
 from cloud_providers.aws.security import SecurityGroupManager
+from cloud_providers.aws.cloudwatch import CloudWatchManager
 
 # MCP FastMCP import
 from fastmcp import FastMCP
@@ -26,6 +28,10 @@ mcp = FastMCP("mcp-aws-server")
 
 # Initialize EC2 manager with region from environment
 region = os.getenv('AWS_REGION', 'us-east-1')
+default_dashboard_name = os.getenv('CW_DASHBOARD_NAME')
+default_log_group = os.getenv('CW_TEST_LOG_GROUP')
+default_instance_id = os.getenv('CW_TEST_INSTANCE_ID')
+default_sns_arn = os.getenv('CW_TEST_SNS_ARN')
 print(f"🚀 Initializing MCP AWS Server (region: {region})", file=sys.stderr)
 
 try:
@@ -37,10 +43,81 @@ try:
     
     security_manager = SecurityGroupManager(region=region)
     print("✅ AWS Security Group Manager initialized", file=sys.stderr)
+
+    cloudwatch_manager = CloudWatchManager(region=region)
+    print("✅ AWS CloudWatch Manager initialized", file=sys.stderr)
 except Exception as e:
     print(f"❌ Failed to initialize AWS Managers: {e}", file=sys.stderr)
     print("⚠️  Make sure AWS credentials are configured", file=sys.stderr)
     sys.exit(1)
+
+
+def _build_observability_snapshot(
+    instance_id: str = None,
+    log_group_name: str = None,
+    minutes: int = 15,
+    metric_period_seconds: int = 60,
+    log_limit: int = 50,
+    alarm_state: str = None,
+) -> dict:
+    """
+    Build a compact observability snapshot combining metrics, logs, and alarms.
+    """
+    resolved_instance_id = instance_id or default_instance_id
+    resolved_log_group = log_group_name or default_log_group
+
+    snapshot = {
+        "region": region,
+        "window_minutes": minutes,
+        "instance_id": resolved_instance_id,
+        "log_group_name": resolved_log_group,
+        "metrics": None,
+        "recent_logs": None,
+        "alarms": None,
+    }
+
+    if resolved_instance_id:
+        try:
+            snapshot["metrics"] = cloudwatch_manager.get_ec2_metrics(
+                instance_id=resolved_instance_id,
+                minutes=minutes,
+                period_seconds=metric_period_seconds,
+            )
+        except Exception as metrics_error:
+            snapshot["metrics"] = {"error": str(metrics_error)}
+
+        try:
+            alarms = cloudwatch_manager.list_alarms(
+                state_value=alarm_state,
+                alarm_name_prefix=None,
+                max_records=100,
+            )
+            matched_alarms = []
+            for alarm in alarms:
+                dims = alarm.get("dimensions", [])
+                if any(d.get("name") == "InstanceId" and d.get("value") == resolved_instance_id for d in dims):
+                    matched_alarms.append(alarm)
+
+            snapshot["alarms"] = {
+                "count": len(matched_alarms),
+                "items": matched_alarms,
+            }
+        except Exception as alarms_error:
+            snapshot["alarms"] = {"error": str(alarms_error)}
+
+    if resolved_log_group:
+        try:
+            logs_result = cloudwatch_manager.filter_logs(
+                log_group_name=resolved_log_group,
+                filter_pattern="",
+                minutes=minutes,
+                limit=log_limit,
+            )
+            snapshot["recent_logs"] = logs_result
+        except Exception as logs_error:
+            snapshot["recent_logs"] = {"error": str(logs_error)}
+
+    return snapshot
 
 
 @mcp.tool()
@@ -148,6 +225,514 @@ async def aws_get_ec2_instance_status(instance_id: str) -> dict:
             "success": False,
             "error": str(e)
         }
+
+
+# ========================================
+# CLOUDWATCH OBSERVABILITY TOOLS
+# ========================================
+
+@mcp.tool()
+async def aws_get_ec2_metrics(instance_id: str = None, minutes: int = 15, period_seconds: int = 60) -> dict:
+    """
+    Get recent EC2 CloudWatch metrics for an instance.
+
+    Args:
+        instance_id: EC2 instance ID (optional if CW_TEST_INSTANCE_ID is set)
+        minutes: Lookback window in minutes (default: 15)
+        period_seconds: Metric period in seconds (default: 60)
+
+    Returns:
+        Dictionary with key EC2 metrics (CPU, network, status checks)
+    """
+    try:
+        resolved_instance_id = instance_id or default_instance_id
+        if not resolved_instance_id:
+            return {
+                "success": False,
+                "error": "Missing instance_id. Provide one or set CW_TEST_INSTANCE_ID in environment."
+            }
+
+        metrics = cloudwatch_manager.get_ec2_metrics(
+            instance_id=resolved_instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+        )
+        return {
+            "success": True,
+            "metrics": metrics
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_list_log_groups(prefix: str = None, limit: int = 50) -> dict:
+    """
+    List CloudWatch log groups.
+
+    Args:
+        prefix: Optional log group name prefix filter
+        limit: Maximum results (default: 50)
+
+    Returns:
+        Dictionary with log groups
+    """
+    try:
+        groups = cloudwatch_manager.list_log_groups(prefix=prefix, limit=limit)
+        return {
+            "success": True,
+            "count": len(groups),
+            "log_groups": groups
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_list_log_streams(log_group_name: str = None, limit: int = 25, descending: bool = True) -> dict:
+    """
+    List log streams in a CloudWatch log group.
+
+    Args:
+        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        limit: Maximum streams to return (default: 25)
+        descending: Newest streams first when True
+
+    Returns:
+        Dictionary with log streams
+    """
+    try:
+        resolved_log_group = log_group_name or default_log_group
+        if not resolved_log_group:
+            return {
+                "success": False,
+                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+            }
+
+        streams = cloudwatch_manager.list_log_streams(
+            log_group_name=resolved_log_group,
+            limit=limit,
+            descending=descending,
+        )
+        return {
+            "success": True,
+            "log_group_name": resolved_log_group,
+            "count": len(streams),
+            "log_streams": streams
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_get_log_events(
+    log_group_name: str = None,
+    log_stream_name: str = None,
+    limit: int = 100,
+    start_from_head: bool = False,
+) -> dict:
+    """
+    Get events from a specific CloudWatch log stream.
+
+    Args:
+        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        log_stream_name: Log stream name (optional; newest stream is used if omitted)
+        limit: Max events (default: 100)
+        start_from_head: If True, fetch oldest first
+
+    Returns:
+        Dictionary with log events
+    """
+    try:
+        resolved_log_group = log_group_name or default_log_group
+        if not resolved_log_group:
+            return {
+                "success": False,
+                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+            }
+
+        resolved_log_stream = log_stream_name
+        if not resolved_log_stream:
+            streams = cloudwatch_manager.list_log_streams(
+                log_group_name=resolved_log_group,
+                limit=1,
+                descending=True,
+            )
+            if not streams:
+                return {
+                    "success": False,
+                    "error": f"No log streams found in log group: {resolved_log_group}"
+                }
+            resolved_log_stream = streams[0].get("log_stream_name")
+
+        result = cloudwatch_manager.get_log_events(
+            log_group_name=resolved_log_group,
+            log_stream_name=resolved_log_stream,
+            limit=limit,
+            start_from_head=start_from_head,
+        )
+        return {
+            "success": True,
+            **result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_filter_logs(
+    log_group_name: str = None,
+    filter_pattern: str = "",
+    minutes: int = 15,
+    limit: int = 100,
+) -> dict:
+    """
+    Filter CloudWatch log events by pattern over a recent time window.
+
+    Args:
+        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        filter_pattern: CloudWatch filter pattern (empty means no filter)
+        minutes: Lookback in minutes (default: 15)
+        limit: Max events (default: 100)
+
+    Returns:
+        Dictionary with filtered log events
+    """
+    try:
+        resolved_log_group = log_group_name or default_log_group
+        if not resolved_log_group:
+            return {
+                "success": False,
+                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+            }
+
+        result = cloudwatch_manager.filter_logs(
+            log_group_name=resolved_log_group,
+            filter_pattern=filter_pattern,
+            minutes=minutes,
+            limit=limit,
+        )
+        return {
+            "success": True,
+            **result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_list_alarms(
+    state_value: str = None,
+    alarm_name_prefix: str = None,
+    max_records: int = 100,
+) -> dict:
+    """
+    List CloudWatch alarms with optional filters.
+
+    Args:
+        state_value: Optional state filter (OK, ALARM, INSUFFICIENT_DATA)
+        alarm_name_prefix: Optional alarm name prefix filter
+        max_records: Maximum records to return
+
+    Returns:
+        Dictionary with alarms
+    """
+    try:
+        alarms = cloudwatch_manager.list_alarms(
+            state_value=state_value,
+            alarm_name_prefix=alarm_name_prefix,
+            max_records=max_records,
+        )
+        return {
+            "success": True,
+            "count": len(alarms),
+            "alarms": alarms
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_list_ec2_alarms(
+    instance_id: str = None,
+    instance_name: str = None,
+    state_value: str = None,
+    max_records: int = 100,
+) -> dict:
+    """
+    List CloudWatch alarms related to a specific EC2 instance.
+
+    This tool resolves alarms by CloudWatch metric dimensions (InstanceId),
+    which is more reliable than filtering by alarm-name prefix.
+
+    Args:
+        instance_id: EC2 instance ID (optional if instance_name is provided)
+        instance_name: EC2 Name tag (optional if instance_id is provided)
+        state_value: Optional state filter (OK, ALARM, INSUFFICIENT_DATA)
+        max_records: Maximum records to retrieve before filtering
+
+    Returns:
+        Dictionary with resolved instance and matching alarms
+    """
+    try:
+        resolved_instance_id = instance_id or default_instance_id
+        resolved_instance_name = instance_name
+
+        # Resolve instance ID by name if needed
+        if not resolved_instance_id and instance_name:
+            instances = ec2_manager.list_instances()
+            target = next(
+                (inst for inst in instances if inst.get("name", "").lower() == instance_name.lower()),
+                None,
+            )
+            if not target:
+                return {
+                    "success": False,
+                    "error": f"EC2 instance not found by name: {instance_name}"
+                }
+            resolved_instance_id = target.get("id")
+            resolved_instance_name = target.get("name")
+
+        if not resolved_instance_id:
+            return {
+                "success": False,
+                "error": "Provide either instance_id or instance_name"
+            }
+
+        alarms = cloudwatch_manager.list_alarms(
+            state_value=state_value,
+            alarm_name_prefix=None,
+            max_records=max_records,
+        )
+
+        # Match alarms by metric dimension InstanceId
+        matched_alarms = []
+        for alarm in alarms:
+            dims = alarm.get("dimensions", [])
+            if any(d.get("name") == "InstanceId" and d.get("value") == resolved_instance_id for d in dims):
+                matched_alarms.append(alarm)
+
+        return {
+            "success": True,
+            "instance_id": resolved_instance_id,
+            "instance_name": resolved_instance_name,
+            "count": len(matched_alarms),
+            "alarms": matched_alarms,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_create_metric_alarm(
+    alarm_name: str,
+    metric_name: str,
+    namespace: str,
+    threshold: float,
+    comparison_operator: str,
+    evaluation_periods: int,
+    period: int,
+    statistic: str = "Average",
+    dimensions: list = None,
+    alarm_actions: list = None,
+    ok_actions: list = None,
+    treat_missing_data: str = "missing",
+    alarm_description: str = None,
+) -> dict:
+    """
+    Create or update a CloudWatch metric alarm.
+
+    Args:
+        alarm_name: Alarm name
+        metric_name: Metric name
+        namespace: Metric namespace (e.g., AWS/EC2)
+        threshold: Threshold value
+        comparison_operator: Comparison operator
+        evaluation_periods: Number of periods to evaluate
+        period: Period length in seconds
+        statistic: Statistic to evaluate (default: Average)
+        dimensions: Optional dimensions list [{"Name": "InstanceId", "Value": "i-..."}]
+        alarm_actions: Optional alarm action ARNs (e.g., SNS topic ARN)
+        ok_actions: Optional OK action ARNs
+        treat_missing_data: missing | breaching | notBreaching | ignore
+        alarm_description: Optional description
+
+    Returns:
+        Dictionary with alarm creation status
+    """
+    try:
+        if not alarm_actions and default_sns_arn:
+            alarm_actions = [default_sns_arn]
+        if not ok_actions and default_sns_arn:
+            ok_actions = [default_sns_arn]
+
+        result = cloudwatch_manager.create_metric_alarm(
+            alarm_name=alarm_name,
+            metric_name=metric_name,
+            namespace=namespace,
+            threshold=threshold,
+            comparison_operator=comparison_operator,
+            evaluation_periods=evaluation_periods,
+            period=period,
+            statistic=statistic,
+            dimensions=dimensions,
+            alarm_actions=alarm_actions,
+            ok_actions=ok_actions,
+            treat_missing_data=treat_missing_data,
+            alarm_description=alarm_description,
+        )
+        return {
+            "success": True,
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_get_dashboard(dashboard_name: str = None) -> dict:
+    """
+    Get a CloudWatch dashboard body by name.
+
+    Args:
+        dashboard_name: Dashboard name (optional if CW_DASHBOARD_NAME is set)
+
+    Returns:
+        Dashboard definition and metadata
+    """
+    try:
+        resolved_dashboard_name = dashboard_name or default_dashboard_name
+        if not resolved_dashboard_name:
+            return {
+                "success": False,
+                "error": "Missing dashboard_name. Provide one or set CW_DASHBOARD_NAME in environment."
+            }
+
+        dashboard = cloudwatch_manager.get_dashboard(resolved_dashboard_name)
+        return {
+            "success": True,
+            "dashboard": dashboard
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.resource("aws://observability/snapshot")
+def aws_observability_snapshot_resource() -> str:
+    """
+    Resource: region-level observability snapshot using configured defaults.
+
+    Uses CW_TEST_INSTANCE_ID and CW_TEST_LOG_GROUP when available.
+    """
+    snapshot = _build_observability_snapshot()
+    return json.dumps(snapshot, indent=2)
+
+
+@mcp.resource("aws://observability/ec2/{instance_id}/snapshot")
+def aws_observability_ec2_snapshot_resource(instance_id: str) -> str:
+    """
+    Resource: observability snapshot for a specific EC2 instance ID.
+    """
+    snapshot = _build_observability_snapshot(instance_id=instance_id)
+    return json.dumps(snapshot, indent=2)
+
+
+@mcp.resource("aws://observability/log-group/{log_group_name}/snapshot")
+def aws_observability_log_group_snapshot_resource(log_group_name: str) -> str:
+    """
+    Resource: observability snapshot focused on a specific CloudWatch log group.
+    """
+    snapshot = _build_observability_snapshot(log_group_name=log_group_name)
+    return json.dumps(snapshot, indent=2)
+
+
+@mcp.prompt()
+def aws_incident_triage_prompt(
+    incident_summary: str,
+    severity: str = "SEV2",
+    instance_id: str = "",
+    log_group_name: str = "",
+) -> str:
+    """
+    Prompt template for EC2/CloudWatch incident triage and first-response actions.
+    """
+    resolved_instance_id = instance_id or default_instance_id or "<unknown-instance-id>"
+    resolved_log_group = log_group_name or default_log_group or "<unknown-log-group>"
+
+    return (
+        "You are the on-call cloud reliability engineer for AWS infrastructure.\\n"
+        f"Severity: {severity}\\n"
+        f"Incident summary: {incident_summary}\\n"
+        f"Target instance: {resolved_instance_id}\\n"
+        f"Target log group: {resolved_log_group}\\n\\n"
+        "Perform triage in this order:\\n"
+        "1) Confirm current instance health and status-check metrics over last 15 minutes.\\n"
+        "2) Identify active ALARM state CloudWatch alarms for this instance by dimension InstanceId.\\n"
+        "3) Pull recent logs and find first error signature and latest recurring pattern.\\n"
+        "4) Correlate timeline across alarms, metrics spikes, and logs.\\n"
+        "5) Propose immediate mitigations and rollback/safety checks.\\n\\n"
+        "Use these MCP resources/tools where applicable:\\n"
+        "- Resource: aws://observability/ec2/{instance_id}/snapshot\\n"
+        "- Resource: aws://observability/log-group/{log_group_name}/snapshot\\n"
+        "- Tool: aws_get_ec2_metrics\\n"
+        "- Tool: aws_list_ec2_alarms\\n"
+        "- Tool: aws_filter_logs\\n"
+        "- Tool: aws_get_log_events\\n\\n"
+        "Output format:\\n"
+        "- Situation summary (3-5 bullets)\\n"
+        "- Most likely root cause\\n"
+        "- Confidence (High/Medium/Low) with evidence\\n"
+        "- Immediate mitigation plan\\n"
+        "- 24-hour prevention follow-up actions"
+    )
+
+
+@mcp.prompt()
+def aws_observability_snapshot_interpreter_prompt(
+    snapshot_json: str,
+    objective: str = "Diagnose likely cause and propose mitigation",
+) -> str:
+    """
+    Prompt template to interpret an observability snapshot payload.
+    """
+    return (
+        "You are analyzing an AWS observability snapshot containing metrics, logs, and alarms.\\n"
+        f"Objective: {objective}\\n\\n"
+        "Snapshot JSON:\\n"
+        f"{snapshot_json}\\n\\n"
+        "Provide:\\n"
+        "1) Top anomalies detected\\n"
+        "2) Probable root cause hypotheses ranked by likelihood\\n"
+        "3) Fast mitigation actions that are safe and reversible\\n"
+        "4) Additional data needed to confirm root cause"
+    )
 
 
 # ========================================

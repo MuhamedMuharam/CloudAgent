@@ -22,6 +22,8 @@ Why stdio?
 
 import asyncio
 import json
+import os
+import re
 from contextlib import AsyncExitStack  # Manages multiple async resources
 from typing import List, Dict, Any, Optional
 
@@ -43,6 +45,12 @@ class MCPClientManager:
         self.sessions: Dict[str, ClientSession] = {}
         self.tools: Dict[str, Dict] = {}  # tool_name -> tool_definition
         self.tool_server_mapping: Dict[str, str] = {}  # tool_name -> server_name
+        self.resources: Dict[str, Dict] = {}  # uri -> resource definition
+        self.resource_server_mapping: Dict[str, str] = {}  # uri -> server_name
+        self.resource_templates: Dict[str, Dict] = {}  # uriTemplate -> template definition
+        self.resource_template_server_mapping: Dict[str, str] = {}  # uriTemplate -> server_name
+        self.prompts: Dict[str, Dict] = {}  # prompt_name -> prompt definition
+        self.prompt_server_mapping: Dict[str, str] = {}  # prompt_name -> server_name
         self.exit_stack = AsyncExitStack()
     
     async def connect_to_server(self, server_name: str, command: str, args: List[str] = None, env: Dict[str, str] = None):
@@ -79,12 +87,18 @@ class MCPClientManager:
         if args is None:
             args = []
         
+        # Merge custom env with parent env so PATH/PYTHONPATH and other
+        # required variables are preserved for MCP server subprocess startup.
+        merged_env = dict(os.environ)
+        if env:
+            merged_env.update(env)
+
         # Configure subprocess parameters
         # This tells MCP SDK how to start the server process
         server_params = StdioServerParameters(
             command=command,  # e.g., 'python'
             args=args,  # e.g., ['mcp_servers/aws_server.py']
-            env=env  # e.g., {'AWS_ACCESS_KEY_ID': '...'}
+            env=merged_env  # includes inherited env + overrides
         )
         
         # Spawn server as subprocess and get stdio streams
@@ -170,6 +184,219 @@ class MCPClientManager:
             
             except Exception as e:
                 print(f"❌ Error discovering tools from {server_name}: {e}")
+
+    async def discover_resources(self):
+        """
+        Discover resources from all connected MCP servers.
+
+        Populates:
+        - self.resources: {uri: {uri, name, description, mimeType}}
+        - self.resource_server_mapping: {uri: server_name}
+        """
+        self.resources = {}
+        self.resource_server_mapping = {}
+
+        for server_name, session in self.sessions.items():
+            try:
+                resources_result = await session.list_resources()
+
+                for resource in resources_result.resources:
+                    uri = str(resource.uri)
+                    self.resources[uri] = {
+                        "uri": uri,
+                        "name": getattr(resource, "name", uri),
+                        "description": getattr(resource, "description", ""),
+                        "mimeType": getattr(resource, "mimeType", None),
+                    }
+                    self.resource_server_mapping[uri] = server_name
+
+                print(f"📚 Discovered {len(resources_result.resources)} resources from {server_name}")
+
+            except Exception as e:
+                print(f"❌ Error discovering resources from {server_name}: {e}")
+
+    async def discover_resource_templates(self):
+        """
+        Discover parameterized resource templates from all connected MCP servers.
+
+        Populates:
+        - self.resource_templates: {uriTemplate: {uriTemplate, name, description, mimeType}}
+        - self.resource_template_server_mapping: {uriTemplate: server_name}
+        """
+        self.resource_templates = {}
+        self.resource_template_server_mapping = {}
+
+        for server_name, session in self.sessions.items():
+            try:
+                templates_result = await session.list_resource_templates()
+
+                for template in templates_result.resourceTemplates:
+                    uri_template = str(template.uriTemplate)
+                    self.resource_templates[uri_template] = {
+                        "uriTemplate": uri_template,
+                        "name": getattr(template, "name", uri_template),
+                        "description": getattr(template, "description", ""),
+                        "mimeType": getattr(template, "mimeType", None),
+                    }
+                    self.resource_template_server_mapping[uri_template] = server_name
+
+                print(f"🧩 Discovered {len(templates_result.resourceTemplates)} resource templates from {server_name}")
+
+            except Exception as e:
+                print(f"❌ Error discovering resource templates from {server_name}: {e}")
+
+    async def discover_prompts(self):
+        """
+        Discover prompt templates from all connected MCP servers.
+
+        Populates:
+        - self.prompts: {prompt_name: {name, description, arguments}}
+        - self.prompt_server_mapping: {prompt_name: server_name}
+        """
+        self.prompts = {}
+        self.prompt_server_mapping = {}
+
+        for server_name, session in self.sessions.items():
+            try:
+                prompts_result = await session.list_prompts()
+
+                for prompt in prompts_result.prompts:
+                    prompt_name = prompt.name
+                    self.prompts[prompt_name] = {
+                        "name": prompt_name,
+                        "description": getattr(prompt, "description", ""),
+                        "arguments": [
+                            {
+                                "name": arg.name,
+                                "description": getattr(arg, "description", ""),
+                                "required": getattr(arg, "required", False),
+                            }
+                            for arg in getattr(prompt, "arguments", [])
+                        ],
+                    }
+                    self.prompt_server_mapping[prompt_name] = server_name
+
+                print(f"🧠 Discovered {len(prompts_result.prompts)} prompts from {server_name}")
+
+            except Exception as e:
+                print(f"❌ Error discovering prompts from {server_name}: {e}")
+
+    async def discover_capabilities(self):
+        """Discover tools, resources, and prompts from connected MCP servers."""
+        await self.discover_tools()
+        await self.discover_resources()
+        await self.discover_resource_templates()
+        await self.discover_prompts()
+
+    @staticmethod
+    def _uri_matches_template(uri: str, uri_template: str) -> bool:
+        """Check whether a concrete URI matches an MCP uriTemplate pattern."""
+        # Convert template placeholders like {instance_id} to one path segment.
+        escaped = re.escape(uri_template)
+        pattern = re.sub(r"\\\{[^{}]+\\\}", r"[^/]+", escaped)
+        return re.fullmatch(pattern, uri) is not None
+
+    def _resolve_server_for_resource_uri(self, uri: str) -> Optional[str]:
+        """
+        Resolve which server should handle a resource URI.
+
+        Resolution order:
+        1) Exact concrete resource URI match
+        2) Match against discovered resource templates
+        """
+        if uri in self.resource_server_mapping:
+            return self.resource_server_mapping[uri]
+
+        for uri_template, server_name in self.resource_template_server_mapping.items():
+            if self._uri_matches_template(uri, uri_template):
+                return server_name
+
+        return None
+
+    async def read_resource(self, uri: str) -> str:
+        """
+        Read a resource by URI from the owning MCP server.
+
+        Returns:
+            JSON string containing normalized resource payload.
+        """
+        server_name = self._resolve_server_for_resource_uri(uri)
+        if not server_name:
+            raise ValueError(f"Unknown MCP resource URI: {uri}")
+
+        session = self.sessions[server_name]
+        result = await session.read_resource(uri)
+
+        normalized_contents = []
+        for item in result.contents:
+            payload = {
+                "uri": str(getattr(item, "uri", uri)),
+                "mime_type": getattr(item, "mimeType", None),
+            }
+
+            if hasattr(item, "text"):
+                payload["text"] = item.text
+            if hasattr(item, "blob"):
+                payload["blob"] = item.blob
+
+            normalized_contents.append(payload)
+
+        return json.dumps(
+            {
+                "success": True,
+                "uri": uri,
+                "server": server_name,
+                "count": len(normalized_contents),
+                "contents": normalized_contents,
+            }
+        )
+
+    async def get_prompt(self, prompt_name: str, arguments: Dict[str, str] = None) -> str:
+        """
+        Render an MCP prompt template with optional string arguments.
+
+        Returns:
+            JSON string containing the rendered prompt message sequence.
+        """
+        if prompt_name not in self.prompt_server_mapping:
+            raise ValueError(f"Unknown MCP prompt: {prompt_name}")
+
+        server_name = self.prompt_server_mapping[prompt_name]
+        session = self.sessions[server_name]
+        result = await session.get_prompt(prompt_name, arguments or {})
+
+        normalized_messages = []
+        for msg in result.messages:
+            content = msg.content
+            content_payload = {
+                "type": getattr(content, "type", content.__class__.__name__),
+            }
+
+            if hasattr(content, "text"):
+                content_payload["text"] = content.text
+            if hasattr(content, "data"):
+                content_payload["data"] = content.data
+            if hasattr(content, "mimeType"):
+                content_payload["mime_type"] = content.mimeType
+            if hasattr(content, "resource"):
+                content_payload["resource"] = str(content.resource)
+
+            normalized_messages.append(
+                {
+                    "role": msg.role,
+                    "content": content_payload,
+                }
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "name": prompt_name,
+                "server": server_name,
+                "description": result.description,
+                "messages": normalized_messages,
+            }
+        )
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """
@@ -217,6 +444,26 @@ class MCPClientManager:
                 {"name": "web-server", "cpu": 2, "ram_gb": 4}
             )
         """
+        if tool_name == "read_mcp_resource":
+            uri = arguments.get("uri")
+            if not uri:
+                raise ValueError("read_mcp_resource requires 'uri'")
+            return await self.read_resource(uri)
+
+        if tool_name == "get_mcp_prompt":
+            prompt_name = arguments.get("name")
+            if not prompt_name:
+                raise ValueError("get_mcp_prompt requires 'name'")
+
+            prompt_args = arguments.get("arguments", {})
+            if prompt_args is None:
+                prompt_args = {}
+            if not isinstance(prompt_args, dict):
+                raise ValueError("get_mcp_prompt 'arguments' must be an object")
+
+            normalized_prompt_args = {str(k): str(v) for k, v in prompt_args.items()}
+            return await self.get_prompt(prompt_name, normalized_prompt_args)
+
         # STEP 1: Find which server provides this tool
         # (from mapping built during discover_tools())
         if tool_name not in self.tool_server_mapping:
@@ -296,6 +543,51 @@ class MCPClientManager:
                     'parameters': tool_def['inputSchema']  # JSON schema from type hints
                 }
             })
+
+        # Synthetic helper for MCP resources.
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "read_mcp_resource",
+                "description": "Read an MCP resource by URI. Use this for URIs like aws://observability/snapshot.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "uri": {
+                            "type": "string",
+                            "description": "Exact MCP resource URI to read",
+                        }
+                    },
+                    "required": ["uri"],
+                },
+            },
+        })
+
+        # Synthetic helper for MCP prompt templates.
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": "get_mcp_prompt",
+                "description": "Render an MCP prompt template by name with optional arguments.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "MCP prompt name",
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "Prompt arguments as string key/value pairs",
+                            "additionalProperties": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        })
         
         return openai_tools
     

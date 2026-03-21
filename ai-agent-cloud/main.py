@@ -83,7 +83,7 @@ if __name__ == "__main__":
    #  7. Associate route tables with appropriate subnets
    #  """
     goal = """
-     Delete VPC called 'test2-vpc' and all associated resources (subnets, gateways, route tables)."""
+    Give me a snapshot of all my ec2 instances"""
     # You can also test other goals:
    
     
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     # ========================================
     # This calls agent/core.py → run_agent_sync()
     # Which internally:
-    # 1. Loads environment variables (.env)
+    # 1. Loads envirmeonment variables (.env)
     # 2. Spawns MCP servers (AWS, Azure, GCP)
     # 3. Discovers tools from servers
     # 4. Runs GPT-4 in a loop to accomplish goal

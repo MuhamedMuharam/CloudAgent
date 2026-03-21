@@ -13,6 +13,7 @@ This module orchestrates the entire agent workflow:
 import asyncio  # For async MCP communication
 import json
 import os
+import re
 from dotenv import load_dotenv  # Load .env file with credentials
 from openai import OpenAI  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
@@ -22,6 +23,97 @@ from .policy_engine import PolicyEngine, PolicyViolation  # Policy validation
 # Load environment variables from .env file
 # This loads: OPENAI_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
 load_dotenv()
+
+
+BASE_SYSTEM_PROMPT = (
+    "You are an autonomous cloud infrastructure agent. "
+    "Use available tools to complete the user's goal directly and safely. "
+    "Think step-by-step, call tools when needed, and do not ask the user for operational steps unless blocked.\n\n"
+    "GENERAL RULES:\n"
+    "- Prefer cost-efficient resources unless explicitly asked otherwise\n"
+    "- Validate assumptions by calling tools before concluding\n"
+    "- If user asks for an MCP resource URI (aws://...), call read_mcp_resource instead of passing URI to AWS API tools\n"
+    "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
+    "- Report exactly what you changed/found\n"
+)
+
+
+INSTRUCTION_PACKS = {
+    "security_groups": (
+        "SECURITY GROUP RULES:\n"
+        "- For IP-based access, use 'cidr'\n"
+        "- For SG-to-SG access, use 'source_security_group_id' and resolve SG IDs first\n"
+        "- Never use a security group name as a CIDR block\n"
+    ),
+    "vpc_deletion": (
+        "VPC DELETION:\n"
+        "- Always use aws_delete_vpc with force=true\n"
+        "- Pass VPC ID or VPC name directly\n"
+        "- Do not manually delete dependent resources first unless explicitly requested\n"
+    ),
+    "cloudwatch_alarms": (
+        "CLOUDWATCH ALARM LOOKUP:\n"
+        "- For alarms related to an EC2 instance, do not rely on alarm_name_prefix with instance Name\n"
+        "- Prefer aws_list_ec2_alarms with instance_name or instance_id\n"
+        "- If unavailable, resolve instance ID first, then filter aws_list_alarms by dimensions where name='InstanceId'\n"
+        "- Do not conclude 'no alarms' without this dimension-based check\n"
+    ),
+}
+
+
+def build_system_prompt(goal: str) -> str:
+    """Build a compact, goal-aware system prompt to reduce token bloat."""
+    goal_text = (goal or "").lower()
+    parts = [BASE_SYSTEM_PROMPT]
+
+    if any(k in goal_text for k in ["security group", "ingress", "egress", "cidr", "sg-"]):
+        parts.append(INSTRUCTION_PACKS["security_groups"])
+
+    if "vpc" in goal_text and any(k in goal_text for k in ["delete", "remove", "destroy"]):
+        parts.append(INSTRUCTION_PACKS["vpc_deletion"])
+
+    if any(k in goal_text for k in ["alarm", "cloudwatch", "dashboard", "log", "metric"]):
+        parts.append(INSTRUCTION_PACKS["cloudwatch_alarms"])
+
+    parts.append("Complete tasks immediately and report what you did.")
+    return "\n\n".join(parts)
+
+
+def build_capability_catalog(mcp_client: MCPClientManager) -> str:
+    """Build a compact non-tool capability catalog for MCP resources/prompts."""
+    catalog = {
+        "resources": sorted(list(mcp_client.resources.keys())),
+        "resource_templates": sorted(list(mcp_client.resource_templates.keys())),
+        "prompts": sorted(list(mcp_client.prompts.keys())),
+    }
+    return (
+        "MCP NON-TOOL CAPABILITY CATALOG (discoverable before planning):\n"
+        f"{json.dumps(catalog, indent=2)}\n\n"
+        "Note: MCP tools are provided separately via the API tools field. "
+        "Use read_mcp_resource/get_mcp_prompt with the catalog above. "
+        "For resource templates, instantiate URIs using real values."
+    )
+
+
+def extract_goal_resource_uris(goal: str) -> list:
+    """Extract explicit MCP-style resource URIs from goal text."""
+    if not goal:
+        return []
+
+    # Match scheme URIs such as aws://observability/snapshot
+    uri_matches = re.findall(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+", goal)
+    cleaned = []
+    for uri in uri_matches:
+        cleaned_uri = uri.rstrip(".,;)")
+        if cleaned_uri not in cleaned:
+            cleaned.append(cleaned_uri)
+    return cleaned
+
+
+def find_prompt_mentions(goal: str, prompt_names: list) -> list:
+    """Find prompt names explicitly mentioned in user goal."""
+    goal_lc = (goal or "").lower()
+    return [name for name in prompt_names if name.lower() in goal_lc]
 
 
 async def run_agent(goal: str, mcp_servers: list = None):
@@ -117,71 +209,123 @@ async def run_agent(goal: str, mcp_servers: list = None):
             )
         
         # ═══════════════════════════════════════════════════════════════
-        # STEP 4: Discover Tools from MCP Servers
+        # STEP 4: Discover Capabilities from MCP Servers
         # ═══════════════════════════════════════════════════════════════
         
-        # Discover tools from all connected servers
-        # Sends MCP "list_tools" request to each server
-        # Servers respond with tool names, descriptions, and parameter schemas
-        print("\n🔍 Discovering tools from MCP servers...")
-        await mcp_client.discover_tools()
+        # Discover tools/resources/prompts from all connected servers.
+        print("\n🔍 Discovering MCP capabilities from servers...")
+        await mcp_client.discover_capabilities()
         
         # Get tools in OpenAI function calling format
         # Converts MCP tool format to OpenAI's expected format
         tools = mcp_client.get_tools_for_openai()
         
-        print(f"\n📋 Available tools: {len(tools)}")
+        print(f"\n📋 Available tools (including MCP helpers): {len(tools)}")
         for tool in tools:
             print(f"   - {tool['function']['name']}")
+
+        if mcp_client.resources:
+            print(f"\n📚 Available resources: {len(mcp_client.resources)}")
+            for uri in mcp_client.resources.keys():
+                print(f"   - {uri}")
+
+        if mcp_client.prompts:
+            print(f"\n🧠 Available prompts: {len(mcp_client.prompts)}")
+            for prompt_name in mcp_client.prompts.keys():
+                print(f"   - {prompt_name}")
+
+        if mcp_client.resource_templates:
+            print(f"\n🧩 Available resource templates: {len(mcp_client.resource_templates)}")
+            for uri_template in mcp_client.resource_templates.keys():
+                print(f"   - {uri_template}")
         
+        # Track actions for this goal
+        actions_taken = []
+
         # Initialize conversation
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are an autonomous cloud infrastructure agent. "
-                    "You manage cloud resources (EC2 instances, VMs, VPCs, Security Groups) using available tools. "
-                    "Think step-by-step and call tools when needed. "
-                    "Make decisions independently without asking the user. \n\n"
-                    
-                    "COST EFFICIENCY:\n"
-                    "- Prefer t3.micro instances (1 CPU, 1GB RAM) as they are free-tier eligible\n"
-                    "- Only use larger instances if specifically requested\n\n"
-                    
-                    "SECURITY GROUP RULES - IMPORTANT:\n"
-                    "When creating security group rules, you MUST choose the correct source type:\n"
-                    "1. For IP-based access: Use 'cidr' parameter\n"
-                    "   Example: {'type': 'ingress', 'protocol': 'tcp', 'port': 80, 'cidr': '0.0.0.0/0'}\n\n"
-                    
-                    "2. For security-group-to-security-group access: Use 'source_security_group_id' parameter\n"
-                    "   - First, look up the source security group ID using aws_list_security_groups\n"
-                    "   - Then use that ID in the rule\n"
-                    "   Example: {'type': 'ingress', 'protocol': 'tcp', 'port': 8080, 'source_security_group_id': 'sg-abc123'}\n\n"
-                    
-                    "NEVER use a security group name as a CIDR block. Always get the security group ID first.\n\n"
-                    
-                    "VPC DELETION - CRITICAL:\n"
-                    "When deleting a VPC, ALWAYS use force=true with aws_delete_vpc.\n"
-                    "- You can pass either VPC ID (vpc-xxx) OR VPC name to aws_delete_vpc\n"
-                    "- With force=true, the tool automatically handles ALL dependencies in the correct order:\n"
-                    "  1. Terminates EC2 instances and waits for termination\n"
-                    "  2. Disassociates route tables from subnets\n"
-                    "  3. Deletes NAT Gateways and waits ~5 minutes for full deletion\n"
-                    "  4. Releases Elastic IPs and waits for propagation\n"
-                    "  5. Detaches and deletes Internet Gateways (with retry logic)\n"
-                    "  6. Deletes route tables\n"
-                    "  7. Deletes subnets\n"
-                    "  8. Deletes security groups\n"
-                    "  9. Deletes the VPC\n"
-                    "- DO NOT manually delete individual components (subnets, IGWs, NAT gateways, etc.)\n"
-                    "- Simply call: aws_delete_vpc with vpc_id='vpc-name-or-id' and force=true\n"
-                    "- The tool handles all complexity and wait times automatically\n\n"
-                    
-                    "Complete tasks immediately and report what you did."
-                )
+                "content": build_system_prompt(goal)
+            },
+            {
+                "role": "system",
+                "content": build_capability_catalog(mcp_client)
             },
             {"role": "user", "content": goal}
         ]
+
+        # Deterministic pre-router: preload explicitly requested MCP resources/prompts
+        # before the first model turn so the model starts with grounded context.
+        preloaded_items = []
+
+        explicit_uris = extract_goal_resource_uris(goal)
+        for uri in explicit_uris:
+            try:
+                preloaded_result = await mcp_client.read_resource(uri)
+                preloaded_items.append(
+                    {
+                        "kind": "resource",
+                        "id": uri,
+                        "result": preloaded_result,
+                    }
+                )
+                actions_taken.append(f"read_mcp_resource({json.dumps({'uri': uri})})")
+            except Exception as e:
+                preloaded_items.append(
+                    {
+                        "kind": "resource",
+                        "id": uri,
+                        "error": str(e),
+                    }
+                )
+
+        mentioned_prompts = find_prompt_mentions(goal, list(mcp_client.prompts.keys()))
+        for prompt_name in mentioned_prompts:
+            prompt_def = mcp_client.prompts.get(prompt_name, {})
+            required_args = [
+                arg.get("name") for arg in prompt_def.get("arguments", []) if arg.get("required")
+            ]
+
+            if required_args:
+                preloaded_items.append(
+                    {
+                        "kind": "prompt",
+                        "id": prompt_name,
+                        "error": f"Skipped auto-render: missing required args {required_args}",
+                    }
+                )
+                continue
+
+            try:
+                preloaded_prompt = await mcp_client.get_prompt(prompt_name, {})
+                preloaded_items.append(
+                    {
+                        "kind": "prompt",
+                        "id": prompt_name,
+                        "result": preloaded_prompt,
+                    }
+                )
+                actions_taken.append(f"get_mcp_prompt({json.dumps({'name': prompt_name, 'arguments': {}})})")
+            except Exception as e:
+                preloaded_items.append(
+                    {
+                        "kind": "prompt",
+                        "id": prompt_name,
+                        "error": str(e),
+                    }
+                )
+
+        if preloaded_items:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "PRELOADED MCP CONTEXT (auto-fetched before planning):\n"
+                        f"{json.dumps(preloaded_items, indent=2)}"
+                    ),
+                }
+            )
         
         print(f"\n🎯 Agent Goal: {goal}\n")
         print("=" * 60)
@@ -189,7 +333,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         # Main agent loop
         iteration = 0
         max_iterations = 5  # Prevent infinite loops (reduced to avoid retries on transient errors)
-        actions_taken = []  # Track actions for this goal
+        # actions_taken initialized before pre-router to include preloaded MCP reads
         
         while iteration < max_iterations:
             iteration += 1
