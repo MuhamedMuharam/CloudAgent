@@ -232,7 +232,13 @@ async def aws_get_ec2_instance_status(instance_id: str) -> dict:
 # ========================================
 
 @mcp.tool()
-async def aws_get_ec2_metrics(instance_id: str = None, minutes: int = 15, period_seconds: int = 60) -> dict:
+async def aws_get_ec2_metrics(
+    instance_id: str = None,
+    minutes: int = 15,
+    period_seconds: int = 60,
+    include_agent_metrics: bool = True,
+    agent_namespace: str = "CWAgent",
+) -> dict:
     """
     Get recent EC2 CloudWatch metrics for an instance.
 
@@ -240,9 +246,11 @@ async def aws_get_ec2_metrics(instance_id: str = None, minutes: int = 15, period
         instance_id: EC2 instance ID (optional if CW_TEST_INSTANCE_ID is set)
         minutes: Lookback window in minutes (default: 15)
         period_seconds: Metric period in seconds (default: 60)
+        include_agent_metrics: Include CloudWatch Agent metrics (disk, mem, swap, io, netstat)
+        agent_namespace: Namespace for CloudWatch Agent metrics
 
     Returns:
-        Dictionary with key EC2 metrics (CPU, network, status checks)
+        Dictionary with EC2 metrics and optional CloudWatch Agent metrics
     """
     try:
         resolved_instance_id = instance_id or default_instance_id
@@ -256,6 +264,8 @@ async def aws_get_ec2_metrics(instance_id: str = None, minutes: int = 15, period
             instance_id=resolved_instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
+            include_agent_metrics=include_agent_metrics,
+            agent_namespace=agent_namespace,
         )
         return {
             "success": True,

@@ -14,6 +14,33 @@ from botocore.exceptions import ClientError
 class CloudWatchManager:
     """Manages AWS CloudWatch observability operations."""
 
+    _EC2_METRIC_SPECS = [
+        ("CPUUtilization", "Percent", "Average"),
+        ("NetworkIn", "Bytes", "Sum"),
+        ("NetworkOut", "Bytes", "Sum"),
+        ("StatusCheckFailed", "Count", "Maximum"),
+        ("StatusCheckFailed_Instance", "Count", "Maximum"),
+        ("StatusCheckFailed_System", "Count", "Maximum"),
+    ]
+
+    _CW_AGENT_METRIC_SPECS = [
+        ("cpu_usage_idle", "Percent", "Average"),
+        ("cpu_usage_iowait", "Percent", "Average"),
+        ("cpu_usage_user", "Percent", "Average"),
+        ("cpu_usage_system", "Percent", "Average"),
+        ("disk_used_percent", "Percent", "Average"),
+        ("disk_inodes_free", None, "Average"),
+        ("diskio_io_time", "Percent", "Average"),
+        ("diskio_write_bytes", "Bytes", "Sum"),
+        ("diskio_read_bytes", "Bytes", "Sum"),
+        ("diskio_writes", None, "Sum"),
+        ("diskio_reads", None, "Sum"),
+        ("mem_used_percent", "Percent", "Average"),
+        ("swap_used_percent", "Percent", "Average"),
+        ("netstat_tcp_established", None, "Average"),
+        ("netstat_tcp_time_wait", None, "Average"),
+    ]
+
     def __init__(self, region: str = "us-east-1"):
         """
         Initialize CloudWatch Manager.
@@ -31,6 +58,8 @@ class CloudWatchManager:
         minutes: int = 15,
         period_seconds: int = 60,
         namespace: str = "AWS/EC2",
+        include_agent_metrics: bool = True,
+        agent_namespace: str = "CWAgent",
     ) -> Dict:
         """
         Get key EC2 CloudWatch metrics for an instance.
@@ -39,7 +68,9 @@ class CloudWatchManager:
             instance_id: EC2 instance ID
             minutes: Time window to query in minutes
             period_seconds: Metrics period in seconds
-            namespace: CloudWatch namespace
+            namespace: Primary CloudWatch namespace (default: AWS/EC2)
+            include_agent_metrics: Include CloudWatch Agent metrics when True
+            agent_namespace: CloudWatch Agent namespace (default: CWAgent)
 
         Returns:
             Dictionary with metric datapoints
@@ -47,55 +78,226 @@ class CloudWatchManager:
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(minutes=minutes)
 
-        metric_specs = [
-            ("CPUUtilization", "Percent", "Average"),
-            ("NetworkIn", "Bytes", "Sum"),
-            ("NetworkOut", "Bytes", "Sum"),
-            ("StatusCheckFailed", "Count", "Maximum"),
-            ("StatusCheckFailed_Instance", "Count", "Maximum"),
-            ("StatusCheckFailed_System", "Count", "Maximum"),
-        ]
-
-        metrics = {}
         try:
-            for metric_name, unit, statistic in metric_specs:
-                response = self.cloudwatch_client.get_metric_statistics(
-                    Namespace=namespace,
-                    MetricName=metric_name,
-                    Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
-                    StartTime=start_time,
-                    EndTime=end_time,
-                    Period=period_seconds,
-                    Statistics=[statistic],
-                    Unit=unit,
-                )
+            primary_metrics = self._fetch_metric_series(
+                namespace=namespace,
+                instance_id=instance_id,
+                start_time=start_time,
+                end_time=end_time,
+                period_seconds=period_seconds,
+                metric_specs=self._EC2_METRIC_SPECS,
+            )
 
-                datapoints = sorted(response.get("Datapoints", []), key=lambda x: x["Timestamp"])
-                metrics[metric_name] = {
-                    "statistic": statistic,
-                    "unit": unit,
-                    "datapoints": [
-                        {
-                            "timestamp": dp["Timestamp"].isoformat(),
-                            "value": dp.get(statistic),
-                        }
-                        for dp in datapoints
-                    ],
-                }
+            namespaced_metrics = {namespace: primary_metrics}
+
+            agent_metrics = {}
+            if include_agent_metrics:
+                agent_metrics = self._fetch_metric_series(
+                    namespace=agent_namespace,
+                    instance_id=instance_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    period_seconds=period_seconds,
+                    metric_specs=self._CW_AGENT_METRIC_SPECS,
+                    use_unit_filter=False,
+                    allow_dimension_fallback=True,
+                )
+                namespaced_metrics[agent_namespace] = agent_metrics
+
+            primary_summary = self._summarize_metric_availability(primary_metrics)
+            agent_summary = self._summarize_metric_availability(agent_metrics) if include_agent_metrics else None
+
+            warnings = []
+            if include_agent_metrics and agent_summary and agent_summary["metrics_with_data"] == 0:
+                warnings.append(
+                    "No datapoints found for CloudWatch Agent metrics in the selected window. "
+                    "This usually means telemetry is unavailable (agent not running, namespace/dimension mismatch, or delayed publishing), "
+                    "not necessarily that disk IO usage is zero."
+                )
 
             return {
                 "instance_id": instance_id,
                 "namespace": namespace,
+                "agent_namespace": agent_namespace if include_agent_metrics else None,
                 "start_time": start_time.isoformat(),
                 "end_time": end_time.isoformat(),
                 "period_seconds": period_seconds,
-                "metrics": metrics,
+                "metrics": primary_metrics,
+                "agent_metrics": agent_metrics,
+                "namespaced_metrics": namespaced_metrics,
+                "availability_summary": {
+                    "primary": primary_summary,
+                    "agent": agent_summary,
+                },
+                "interpretation_guardrails": [
+                    "Treat empty datapoints as missing telemetry unless corroborated by other evidence.",
+                    "Do not conclude low/no activity solely from empty datapoints.",
+                ],
+                "warnings": warnings,
             }
 
         except ClientError as e:
             error_msg = f"Failed to fetch EC2 metrics: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
+
+    def _fetch_metric_series(
+        self,
+        namespace: str,
+        instance_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        period_seconds: int,
+        metric_specs: List,
+        use_unit_filter: bool = True,
+        allow_dimension_fallback: bool = False,
+    ) -> Dict:
+        metrics = {}
+
+        for metric_name, unit, statistic in metric_specs:
+            base_dimensions = [{"Name": "InstanceId", "Value": instance_id}]
+            datapoints = self._query_metric_datapoints(
+                namespace=namespace,
+                metric_name=metric_name,
+                dimensions=base_dimensions,
+                start_time=start_time,
+                end_time=end_time,
+                period_seconds=period_seconds,
+                statistic=statistic,
+                unit=unit if use_unit_filter else None,
+            )
+
+            if not datapoints and allow_dimension_fallback:
+                discovered_dimensions = self._discover_metric_dimensions(
+                    namespace=namespace,
+                    metric_name=metric_name,
+                    instance_id=instance_id,
+                )
+
+                merged_points = []
+                for dimensions in discovered_dimensions:
+                    # Avoid re-querying the base dimensions set.
+                    if self._normalize_dimensions(dimensions) == self._normalize_dimensions(base_dimensions):
+                        continue
+
+                    merged_points.extend(
+                        self._query_metric_datapoints(
+                            namespace=namespace,
+                            metric_name=metric_name,
+                            dimensions=dimensions,
+                            start_time=start_time,
+                            end_time=end_time,
+                            period_seconds=period_seconds,
+                            statistic=statistic,
+                            unit=None,
+                        )
+                    )
+
+                if merged_points:
+                    # Keep one datapoint per timestamp (latest value wins on collision).
+                    deduped = {dp["Timestamp"]: dp for dp in merged_points}
+                    datapoints = sorted(deduped.values(), key=lambda x: x["Timestamp"])
+
+            metrics[metric_name] = {
+                "statistic": statistic,
+                "unit": unit,
+                "datapoints": [
+                    {
+                        "timestamp": dp["Timestamp"].isoformat(),
+                        "value": dp.get(statistic),
+                    }
+                    for dp in datapoints
+                ],
+            }
+
+        return metrics
+
+    def _query_metric_datapoints(
+        self,
+        namespace: str,
+        metric_name: str,
+        dimensions: List[Dict[str, str]],
+        start_time: datetime,
+        end_time: datetime,
+        period_seconds: int,
+        statistic: str,
+        unit: Optional[str] = None,
+    ) -> List[Dict]:
+        params = {
+            "Namespace": namespace,
+            "MetricName": metric_name,
+            "Dimensions": dimensions,
+            "StartTime": start_time,
+            "EndTime": end_time,
+            "Period": period_seconds,
+            "Statistics": [statistic],
+        }
+
+        if unit:
+            params["Unit"] = unit
+
+        response = self.cloudwatch_client.get_metric_statistics(**params)
+        return response.get("Datapoints", [])
+
+    def _discover_metric_dimensions(
+        self,
+        namespace: str,
+        metric_name: str,
+        instance_id: str,
+    ) -> List[List[Dict[str, str]]]:
+        dimensions = []
+        next_token = None
+
+        while True:
+            params = {
+                "Namespace": namespace,
+                "MetricName": metric_name,
+                "Dimensions": [{"Name": "InstanceId", "Value": instance_id}],
+            }
+            if next_token:
+                params["NextToken"] = next_token
+
+            response = self.cloudwatch_client.list_metrics(**params)
+            for metric in response.get("Metrics", []):
+                metric_dimensions = metric.get("Dimensions", [])
+                if metric_dimensions:
+                    dimensions.append(metric_dimensions)
+
+            next_token = response.get("NextToken")
+            if not next_token:
+                break
+
+        return dimensions
+
+    @staticmethod
+    def _normalize_dimensions(dimensions: List[Dict[str, str]]) -> List[tuple]:
+        return sorted(
+            [(d.get("Name"), d.get("Value")) for d in dimensions],
+            key=lambda item: (item[0] or "", item[1] or ""),
+        )
+
+    def _summarize_metric_availability(self, metrics: Dict) -> Dict:
+        total_metrics = len(metrics)
+        metrics_with_data = 0
+        metrics_without_data = []
+        total_datapoints = 0
+
+        for metric_name, metric_payload in metrics.items():
+            datapoints = metric_payload.get("datapoints", [])
+            datapoint_count = len(datapoints)
+            total_datapoints += datapoint_count
+
+            if datapoint_count > 0:
+                metrics_with_data += 1
+            else:
+                metrics_without_data.append(metric_name)
+
+        return {
+            "total_metrics": total_metrics,
+            "metrics_with_data": metrics_with_data,
+            "metrics_without_data": metrics_without_data,
+            "total_datapoints": total_datapoints,
+        }
 
     def list_log_groups(self, prefix: Optional[str] = None, limit: int = 50) -> List[Dict]:
         """

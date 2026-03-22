@@ -57,6 +57,11 @@ INSTRUCTION_PACKS = {
         "- Prefer aws_list_ec2_alarms with instance_name or instance_id\n"
         "- If unavailable, resolve instance ID first, then filter aws_list_alarms by dimensions where name='InstanceId'\n"
         "- Do not conclude 'no alarms' without this dimension-based check\n"
+        "- For CloudWatch metric queries, choose period_seconds by lookback window to avoid oversampling:\n"
+        "  * up to 30 minutes -> 60 seconds\n"
+        "  * 31 to 180 minutes -> 300 seconds\n"
+        "  * more than 180 minutes -> 900 seconds or more\n"
+        "- If user asks for last hour metrics, explicitly call aws_get_ec2_metrics with period_seconds=300\n"
     ),
 }
 

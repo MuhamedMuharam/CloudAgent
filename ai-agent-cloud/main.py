@@ -83,9 +83,9 @@ if __name__ == "__main__":
    #  7. Associate route tables with appropriate subnets
    #  """
     goal = """
-    Give me a snapshot of all my ec2 instances"""
+    summarize to me the diskio section of the metrics last hour for the instance named TestWebServer."""
     # You can also test other goals:
-   
+    # Investigate instance named TestWebServer. Check alarms, metrics, and logs. Give me the current state , Identify root cause (if there is a problem) and propose immediate mitigation.
     
     print("🚀 Starting AI Agent with MCP...\n")
     print(f"📝 Goal: {goal}\n")
