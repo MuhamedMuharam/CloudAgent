@@ -4,6 +4,7 @@ Handles CloudWatch Metrics, Logs, Alarms, and Dashboards.
 """
 
 import sys
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -24,21 +25,11 @@ class CloudWatchManager:
     ]
 
     _CW_AGENT_METRIC_SPECS = [
-        ("cpu_usage_idle", "Percent", "Average"),
-        ("cpu_usage_iowait", "Percent", "Average"),
-        ("cpu_usage_user", "Percent", "Average"),
-        ("cpu_usage_system", "Percent", "Average"),
         ("disk_used_percent", "Percent", "Average"),
         ("disk_inodes_free", None, "Average"),
         ("diskio_io_time", "Percent", "Average"),
-        ("diskio_write_bytes", "Bytes", "Sum"),
-        ("diskio_read_bytes", "Bytes", "Sum"),
-        ("diskio_writes", None, "Sum"),
-        ("diskio_reads", None, "Sum"),
         ("mem_used_percent", "Percent", "Average"),
         ("swap_used_percent", "Percent", "Average"),
-        ("netstat_tcp_established", None, "Average"),
-        ("netstat_tcp_time_wait", None, "Average"),
     ]
 
     def __init__(self, region: str = "us-east-1"):
@@ -51,6 +42,7 @@ class CloudWatchManager:
         self.region = region
         self.cloudwatch_client = boto3.client("cloudwatch", region_name=region)
         self.logs_client = boto3.client("logs", region_name=region)
+        self.sqs_client = boto3.client("sqs", region_name=region)
 
     def get_ec2_metrics(
         self,
@@ -140,6 +132,110 @@ class CloudWatchManager:
             error_msg = f"Failed to fetch EC2 metrics: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
+
+    def poll_alarm_notifications(
+        self,
+        queue_url: str,
+        max_messages: int = 5,
+        wait_time_seconds: int = 5,
+        visibility_timeout: int = 60,
+        delete_on_read: bool = False,
+    ) -> Dict:
+        """
+        Poll alarm notifications delivered from SNS to SQS.
+
+        Args:
+            queue_url: SQS queue URL subscribed to SNS alarm topic
+            max_messages: Number of messages to retrieve (1-10)
+            wait_time_seconds: Long-poll wait duration
+            visibility_timeout: Hide received messages for this duration
+            delete_on_read: Delete messages after successful parsing
+
+        Returns:
+            Dictionary with normalized alarm notifications
+        """
+        try:
+            response = self.sqs_client.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=max(1, min(max_messages, 10)),
+                WaitTimeSeconds=max(0, min(wait_time_seconds, 20)),
+                VisibilityTimeout=max(0, visibility_timeout),
+                MessageAttributeNames=["All"],
+                AttributeNames=["All"],
+            )
+
+            messages = response.get("Messages", [])
+            notifications = []
+            deleted_count = 0
+
+            for message in messages:
+                body_raw = message.get("Body", "")
+                body = self._safe_json_load(body_raw)
+
+                sns_envelope = body if isinstance(body, dict) and body.get("Type") == "Notification" else {}
+                sns_payload_raw = sns_envelope.get("Message", body_raw)
+                sns_payload = self._safe_json_load(sns_payload_raw)
+
+                notification = {
+                    "sqs_message_id": message.get("MessageId"),
+                    "receipt_handle": message.get("ReceiptHandle"),
+                    "sns_message_id": sns_envelope.get("MessageId"),
+                    "topic_arn": sns_envelope.get("TopicArn"),
+                    "subject": sns_envelope.get("Subject"),
+                    "published_at": sns_envelope.get("Timestamp"),
+                    "alarm": {
+                        "name": sns_payload.get("AlarmName") if isinstance(sns_payload, dict) else None,
+                        "new_state": sns_payload.get("NewStateValue") if isinstance(sns_payload, dict) else None,
+                        "reason": sns_payload.get("NewStateReason") if isinstance(sns_payload, dict) else None,
+                        "state_changed_at": sns_payload.get("StateChangeTime") if isinstance(sns_payload, dict) else None,
+                        "description": sns_payload.get("AlarmDescription") if isinstance(sns_payload, dict) else None,
+                    },
+                    "payload": sns_payload,
+                }
+
+                notifications.append(notification)
+
+                if delete_on_read and message.get("ReceiptHandle"):
+                    self.sqs_client.delete_message(
+                        QueueUrl=queue_url,
+                        ReceiptHandle=message["ReceiptHandle"],
+                    )
+                    deleted_count += 1
+
+            return {
+                "queue_url": queue_url,
+                "count": len(notifications),
+                "deleted_count": deleted_count,
+                "notifications": notifications,
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to poll alarm notifications from SQS: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def delete_alarm_notification(self, queue_url: str, receipt_handle: str) -> Dict:
+        """Delete a single SQS alarm notification by receipt handle."""
+        try:
+            self.sqs_client.delete_message(
+                QueueUrl=queue_url,
+                ReceiptHandle=receipt_handle,
+            )
+            return {
+                "queue_url": queue_url,
+                "deleted": True,
+            }
+        except ClientError as e:
+            error_msg = f"Failed to delete SQS alarm notification: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    @staticmethod
+    def _safe_json_load(value: str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
 
     def _fetch_metric_series(
         self,

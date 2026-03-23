@@ -53,6 +53,8 @@ INSTRUCTION_PACKS = {
     ),
     "cloudwatch_alarms": (
         "CLOUDWATCH ALARM LOOKUP:\n"
+        "- For incident/alarm-response tasks, call aws_poll_alarm_notifications first\n"
+        "- Prioritize newest notifications where alarm.new_state is ALARM\n"
         "- For alarms related to an EC2 instance, do not rely on alarm_name_prefix with instance Name\n"
         "- Prefer aws_list_ec2_alarms with instance_name or instance_id\n"
         "- If unavailable, resolve instance ID first, then filter aws_list_alarms by dimensions where name='InstanceId'\n"

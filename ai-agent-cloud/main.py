@@ -83,8 +83,10 @@ if __name__ == "__main__":
    #  7. Associate route tables with appropriate subnets
    #  """
     goal = """
-    summarize to me the diskio section of the metrics last hour for the instance named TestWebServer."""
+    Check pending alarm notifications from SQS and triage the latest ALARM for TestWebServer with mitigation steps.
+    """
     # You can also test other goals:
+    #summarize to me the diskio section of the metrics last hour for the instance named TestWebServer.
     # Investigate instance named TestWebServer. Check alarms, metrics, and logs. Give me the current state , Identify root cause (if there is a problem) and propose immediate mitigation.
     
     print("🚀 Starting AI Agent with MCP...\n")

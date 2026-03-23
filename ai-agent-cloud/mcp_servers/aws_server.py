@@ -32,6 +32,7 @@ default_dashboard_name = os.getenv('CW_DASHBOARD_NAME')
 default_log_group = os.getenv('CW_TEST_LOG_GROUP')
 default_instance_id = os.getenv('CW_TEST_INSTANCE_ID')
 default_sns_arn = os.getenv('CW_TEST_SNS_ARN')
+default_alarm_queue_url = os.getenv('ALARM_SQS_QUEUE_URL')
 print(f"🚀 Initializing MCP AWS Server (region: {region})", file=sys.stderr)
 
 try:
@@ -555,6 +556,93 @@ async def aws_list_ec2_alarms(
 
 
 @mcp.tool()
+async def aws_poll_alarm_notifications(
+    queue_url: str = None,
+    max_messages: int = 5,
+    wait_time_seconds: int = 5,
+    visibility_timeout: int = 60,
+    delete_on_read: bool = False,
+) -> dict:
+    """
+    Poll SQS for CloudWatch alarm notifications delivered via SNS.
+
+    Args:
+        queue_url: SQS queue URL (optional if ALARM_SQS_QUEUE_URL is set)
+        max_messages: Number of messages to retrieve (1-10)
+        wait_time_seconds: Long-poll wait duration in seconds
+        visibility_timeout: Visibility timeout in seconds for received messages
+        delete_on_read: Delete messages after reading when True
+
+    Returns:
+        Dictionary with normalized alarm notifications
+    """
+    try:
+        resolved_queue_url = queue_url or default_alarm_queue_url
+        if not resolved_queue_url:
+            return {
+                "success": False,
+                "error": "Missing queue_url. Provide one or set ALARM_SQS_QUEUE_URL in environment."
+            }
+
+        result = cloudwatch_manager.poll_alarm_notifications(
+            queue_url=resolved_queue_url,
+            max_messages=max_messages,
+            wait_time_seconds=wait_time_seconds,
+            visibility_timeout=visibility_timeout,
+            delete_on_read=delete_on_read,
+        )
+        return {
+            "success": True,
+            **result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_delete_alarm_notification(queue_url: str = None, receipt_handle: str = None) -> dict:
+    """
+    Acknowledge an SQS alarm notification by deleting it with the receipt handle.
+
+    Args:
+        queue_url: SQS queue URL (optional if ALARM_SQS_QUEUE_URL is set)
+        receipt_handle: SQS receipt handle from aws_poll_alarm_notifications
+
+    Returns:
+        Dictionary with deletion status
+    """
+    try:
+        resolved_queue_url = queue_url or default_alarm_queue_url
+        if not resolved_queue_url:
+            return {
+                "success": False,
+                "error": "Missing queue_url. Provide one or set ALARM_SQS_QUEUE_URL in environment."
+            }
+        if not receipt_handle:
+            return {
+                "success": False,
+                "error": "Missing receipt_handle from aws_poll_alarm_notifications response."
+            }
+
+        result = cloudwatch_manager.delete_alarm_notification(
+            queue_url=resolved_queue_url,
+            receipt_handle=receipt_handle,
+        )
+        return {
+            "success": True,
+            **result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
 async def aws_create_metric_alarm(
     alarm_name: str,
     metric_name: str,
@@ -711,6 +799,7 @@ def aws_incident_triage_prompt(
         "Use these MCP resources/tools where applicable:\\n"
         "- Resource: aws://observability/ec2/{instance_id}/snapshot\\n"
         "- Resource: aws://observability/log-group/{log_group_name}/snapshot\\n"
+        "- Tool: aws_poll_alarm_notifications\n"
         "- Tool: aws_get_ec2_metrics\\n"
         "- Tool: aws_list_ec2_alarms\\n"
         "- Tool: aws_filter_logs\\n"
