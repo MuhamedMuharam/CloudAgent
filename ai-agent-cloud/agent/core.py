@@ -14,6 +14,7 @@ import asyncio  # For async MCP communication
 import json
 import os
 import re
+import sys
 from dotenv import load_dotenv  # Load .env file with credentials
 from openai import OpenAI  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
@@ -193,7 +194,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         mcp_servers = [
             {
                 'name': 'aws',  # Identifier for this server
-                'command': 'python',  # Command to run
+                'command': sys.executable,  # Use current interpreter/venv
                 'args': [os.path.join(os.path.dirname(__file__), '..', 'mcp_servers', 'aws_server.py')],
                 'env': aws_env  # Environment variables (AWS credentials)
             }
