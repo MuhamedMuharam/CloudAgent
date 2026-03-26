@@ -20,6 +20,7 @@ from cloud_providers.aws.vpc import VPCManager
 from cloud_providers.aws.security import SecurityGroupManager
 from cloud_providers.aws.cloudwatch import CloudWatchManager
 from cloud_providers.aws.ssm import SSMManager
+from cloud_providers.aws.xray import XRayManager
 
 # MCP FastMCP import
 from fastmcp import FastMCP
@@ -51,6 +52,9 @@ try:
 
     ssm_manager = SSMManager(region=region)
     print("✅ AWS SSM Manager initialized", file=sys.stderr)
+
+    xray_manager = XRayManager(region=region)
+    print("✅ AWS X-Ray Manager initialized", file=sys.stderr)
 except Exception as e:
     print(f"❌ Failed to initialize AWS Managers: {e}", file=sys.stderr)
     print("⚠️  Make sure AWS credentials are configured", file=sys.stderr)
@@ -599,6 +603,88 @@ async def aws_ssm_list_running_services(
             "error": str(e)
         }
 
+
+@mcp.tool()
+async def aws_get_xray_trace_summaries(
+    minutes: int = 15,
+    max_results: int = 20,
+    filter_expression: str = None,
+) -> dict:
+    """
+    Get recent AWS X-Ray trace summaries.
+
+    Args:
+        minutes: Lookback window in minutes
+        max_results: Maximum trace summaries to return
+        filter_expression: Optional X-Ray filter expression
+
+    Returns:
+        Dictionary with trace summary list
+    """
+    try:
+        result = xray_manager.get_trace_summaries(
+            minutes=minutes,
+            max_results=max_results,
+            filter_expression=filter_expression,
+        )
+        return {
+            "success": True,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_get_xray_trace_details(trace_ids: list) -> dict:
+    """
+    Get detailed AWS X-Ray traces by trace IDs.
+
+    Args:
+        trace_ids: List of X-Ray trace IDs
+
+    Returns:
+        Dictionary with trace documents and segment data
+    """
+    try:
+        result = xray_manager.batch_get_traces(trace_ids=trace_ids)
+        return {
+            "success": True,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_get_xray_service_graph(minutes: int = 15) -> dict:
+    """
+    Get AWS X-Ray service graph for recent traffic.
+
+    Args:
+        minutes: Lookback window in minutes
+
+    Returns:
+        Dictionary containing X-Ray service graph nodes/edges
+    """
+    try:
+        result = xray_manager.get_service_graph(minutes=minutes)
+        return {
+            "success": True,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+    
 
 # ========================================
 # CLOUDWATCH OBSERVABILITY TOOLS

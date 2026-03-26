@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+celery[redis]
+redis
+pydantic
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-celery
+opentelemetry-instrumentation-redis
+opentelemetry-propagator-aws-xray
+opentelemetry-sdk-extension-aws
