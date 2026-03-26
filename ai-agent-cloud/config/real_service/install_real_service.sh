@@ -11,7 +11,10 @@ OTEL_BIN="/opt/aws/aws-otel-collector/bin/aws-otel-collector"
 
 echo "[1/8] Installing OS dependencies..."
 sudo dnf update -y
-sudo dnf install -y python3 python3-pip redis6 curl
+sudo dnf install -y python3 python3-pip redis6
+if ! command -v curl >/dev/null 2>&1; then
+  sudo dnf install -y curl-minimal || sudo dnf install -y curl
+fi
 
 echo "[2/8] Enabling Redis broker..."
 sudo systemctl enable redis6
