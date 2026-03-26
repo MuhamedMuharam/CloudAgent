@@ -23,6 +23,7 @@ class EC2Manager:
         self.region = region
         self.ec2_client = boto3.client('ec2', region_name=region)
         self.ec2_resource = boto3.resource('ec2', region_name=region)
+        self.ssm_client = boto3.client('ssm', region_name=region)
     
     def list_instances(self, tag_filter: Optional[Dict[str, str]] = None) -> List[Dict]:
         """
@@ -172,6 +173,133 @@ class EC2Manager:
         
         except ClientError as e:
             error_msg = f"Failed to delete instance: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def start_instance(self, instance_id: str) -> Dict:
+        """
+        Start a stopped EC2 instance.
+
+        Args:
+            instance_id: EC2 instance ID
+
+        Returns:
+            Dictionary with state transition details
+        """
+        try:
+            response = self.ec2_client.start_instances(InstanceIds=[instance_id])
+            transition = response['StartingInstances'][0]
+
+            return {
+                'id': instance_id,
+                'previous_state': transition['PreviousState']['Name'],
+                'current_state': transition['CurrentState']['Name'],
+                'message': f'Instance {instance_id} start initiated'
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to start instance: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def stop_instance(self, instance_id: str, force: bool = False) -> Dict:
+        """
+        Stop a running EC2 instance.
+
+        Args:
+            instance_id: EC2 instance ID
+            force: Force stop if graceful shutdown fails
+
+        Returns:
+            Dictionary with state transition details
+        """
+        try:
+            response = self.ec2_client.stop_instances(
+                InstanceIds=[instance_id],
+                Force=force,
+            )
+            transition = response['StoppingInstances'][0]
+
+            return {
+                'id': instance_id,
+                'previous_state': transition['PreviousState']['Name'],
+                'current_state': transition['CurrentState']['Name'],
+                'force': force,
+                'message': f'Instance {instance_id} stop initiated'
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to stop instance: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def reboot_instance(self, instance_id: str) -> Dict:
+        """
+        Reboot a running EC2 instance.
+
+        Args:
+            instance_id: EC2 instance ID
+
+        Returns:
+            Dictionary with reboot request status
+        """
+        try:
+            self.ec2_client.reboot_instances(InstanceIds=[instance_id])
+            return {
+                'id': instance_id,
+                'message': f'Instance {instance_id} reboot initiated'
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to reboot instance: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def get_instance_ssm_status(self, instance_id: str) -> Dict:
+        """
+        Get AWS Systems Manager (SSM) managed-instance status for an EC2 instance.
+
+        Args:
+            instance_id: EC2 instance ID
+
+        Returns:
+            Dictionary with SSM online/offline state and metadata
+        """
+        try:
+            response = self.ssm_client.describe_instance_information(
+                Filters=[
+                    {
+                        'Key': 'InstanceIds',
+                        'Values': [instance_id],
+                    }
+                ],
+                MaxResults=10,
+            )
+
+            info_list = response.get('InstanceInformationList', [])
+            if not info_list:
+                return {
+                    'instance_id': instance_id,
+                    'managed_by_ssm': False,
+                    'ping_status': 'NotManaged',
+                    'message': 'Instance not found in SSM managed instances. Check IAM role and SSM agent registration.'
+                }
+
+            info = info_list[0]
+            return {
+                'instance_id': instance_id,
+                'managed_by_ssm': True,
+                'ping_status': info.get('PingStatus', 'Unknown'),
+                'platform_name': info.get('PlatformName', 'Unknown'),
+                'platform_version': info.get('PlatformVersion', 'Unknown'),
+                'agent_version': info.get('AgentVersion', 'Unknown'),
+                'is_latest_version': info.get('IsLatestVersion', False),
+                'last_ping_date_time': str(info.get('LastPingDateTime', 'Unknown')),
+                'resource_type': info.get('ResourceType', 'Unknown')
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to get SSM status: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
     

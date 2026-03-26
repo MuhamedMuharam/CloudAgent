@@ -19,6 +19,7 @@ from cloud_providers.aws.ec2 import EC2Manager
 from cloud_providers.aws.vpc import VPCManager
 from cloud_providers.aws.security import SecurityGroupManager
 from cloud_providers.aws.cloudwatch import CloudWatchManager
+from cloud_providers.aws.ssm import SSMManager
 
 # MCP FastMCP import
 from fastmcp import FastMCP
@@ -47,6 +48,9 @@ try:
 
     cloudwatch_manager = CloudWatchManager(region=region)
     print("✅ AWS CloudWatch Manager initialized", file=sys.stderr)
+
+    ssm_manager = SSMManager(region=region)
+    print("✅ AWS SSM Manager initialized", file=sys.stderr)
 except Exception as e:
     print(f"❌ Failed to initialize AWS Managers: {e}", file=sys.stderr)
     print("⚠️  Make sure AWS credentials are configured", file=sys.stderr)
@@ -220,6 +224,374 @@ async def aws_get_ec2_instance_status(instance_id: str) -> dict:
         return {
             "success": True,
             "instance": status
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_start_ec2_instance(instance_id: str) -> dict:
+    """
+    Start a stopped EC2 instance.
+
+    Args:
+        instance_id: EC2 instance ID
+
+    Returns:
+        Dictionary with success status and state transition details
+    """
+    try:
+        result = ec2_manager.start_instance(instance_id)
+        return {
+            "success": True,
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_stop_ec2_instance(instance_id: str, force: bool = False) -> dict:
+    """
+    Stop a running EC2 instance.
+
+    Args:
+        instance_id: EC2 instance ID
+        force: Force stop if graceful shutdown fails
+
+    Returns:
+        Dictionary with success status and state transition details
+    """
+    try:
+        result = ec2_manager.stop_instance(instance_id, force=force)
+        return {
+            "success": True,
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_reboot_ec2_instance(instance_id: str) -> dict:
+    """
+    Reboot a running EC2 instance.
+
+    Args:
+        instance_id: EC2 instance ID
+
+    Returns:
+        Dictionary with success status
+    """
+    try:
+        result = ec2_manager.reboot_instance(instance_id)
+        return {
+            "success": True,
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_get_ec2_instance_ssm_status(instance_id: str) -> dict:
+    """
+    Check whether an EC2 instance is managed by SSM and online.
+
+    Args:
+        instance_id: EC2 instance ID
+
+    Returns:
+        Dictionary with SSM managed-instance status
+    """
+    try:
+        status = ec2_manager.get_instance_ssm_status(instance_id)
+        return {
+            "success": True,
+            "status": status
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_run_command(
+    instance_ids: list,
+    commands: list,
+    comment: str = None,
+    timeout_seconds: int = 600,
+    working_directory: str = None,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Execute shell commands on EC2 instances via AWS SSM Run Command.
+
+    Args:
+        instance_ids: List of EC2 instance IDs
+        commands: List of shell commands to execute in order
+        comment: Optional command description
+        timeout_seconds: Command timeout in seconds
+        working_directory: Optional working directory on target host
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.run_command(
+            instance_ids=instance_ids,
+            commands=commands,
+            comment=comment,
+            timeout_seconds=timeout_seconds,
+            working_directory=working_directory,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_get_command_output(command_id: str, instance_id: str) -> dict:
+    """
+    Get output for a previously issued SSM Run Command invocation.
+
+    Args:
+        command_id: SSM command ID
+        instance_id: EC2 instance ID where command executed
+
+    Returns:
+        Dictionary with status, stdout, and stderr
+    """
+    try:
+        output = ssm_manager.get_command_output(command_id=command_id, instance_id=instance_id)
+        return {
+            "success": True,
+            "output": output
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_start_service(
+    instance_ids: list,
+    service_name: str,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Start a systemd service on one or more EC2 instances via SSM.
+
+    Args:
+        instance_ids: List of EC2 instance IDs
+        service_name: Systemd service unit name (e.g., ai-agent.service)
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.start_service(
+            instance_ids=instance_ids,
+            service_name=service_name,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_stop_service(
+    instance_ids: list,
+    service_name: str,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Stop a systemd service on one or more EC2 instances via SSM.
+
+    Args:
+        instance_ids: List of EC2 instance IDs
+        service_name: Systemd service unit name
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.stop_service(
+            instance_ids=instance_ids,
+            service_name=service_name,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_restart_service(
+    instance_ids: list,
+    service_name: str,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Restart a systemd service on one or more EC2 instances via SSM.
+
+    Args:
+        instance_ids: List of EC2 instance IDs
+        service_name: Systemd service unit name
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.restart_service(
+            instance_ids=instance_ids,
+            service_name=service_name,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_get_service_status(
+    instance_ids: list,
+    service_name: str,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Get active/inactive status of a systemd service via SSM.
+
+    Args:
+        instance_ids: List of EC2 instance IDs
+        service_name: Systemd service unit name
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.get_service_status(
+            instance_ids=instance_ids,
+            service_name=service_name,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_ssm_list_running_services(
+    instance_id: str,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 60,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    List running systemd services on an EC2 instance via SSM.
+
+    Args:
+        instance_id: EC2 instance ID
+        wait_for_completion: When True, waits and returns stdout/stderr inline
+        completion_timeout_seconds: Maximum wait time for final command status
+        poll_interval_seconds: Poll interval while waiting for completion
+
+    Returns:
+        Dictionary with command metadata and optional invocation outputs
+    """
+    try:
+        result = ssm_manager.list_running_services(
+            instance_id=instance_id,
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "success": True,
+            "result": result
         }
     except Exception as e:
         return {

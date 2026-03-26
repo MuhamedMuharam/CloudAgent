@@ -35,6 +35,7 @@ BASE_SYSTEM_PROMPT = (
     "- Validate assumptions by calling tools before concluding\n"
     "- If user asks for an MCP resource URI (aws://...), call read_mcp_resource instead of passing URI to AWS API tools\n"
     "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
+    "- For host-level operations on EC2 instances, prefer SSM tools over ad-hoc shell approaches\n"
     "- Report exactly what you changed/found\n"
 )
 
@@ -67,6 +68,16 @@ INSTRUCTION_PACKS = {
         "  * more than 180 minutes -> 900 seconds or more\n"
         "- If user asks for last hour metrics, explicitly call aws_get_ec2_metrics with period_seconds=300\n"
     ),
+    "ssm_execution": (
+        "SSM COMMAND EXECUTION:\n"
+        "- Prefer aws_ssm_run_command as the default for remote command execution\n"
+        "- For normal operations, call aws_ssm_run_command with wait_for_completion=true to get stdout/stderr inline\n"
+        "- Use aws_ssm_get_command_output only when:\n"
+        "  * a command was submitted with wait_for_completion=false, or\n"
+        "  * a previous command timed out client-side and you need a later/follow-up fetch, or\n"
+        "  * you are checking progress of a long-running command\n"
+        "- If goal references an instance by name only, resolve it first with aws_list_ec2_instances to obtain instance_id\n"
+    ),
 }
 
 
@@ -83,6 +94,11 @@ def build_system_prompt(goal: str) -> str:
 
     if any(k in goal_text for k in ["alarm", "cloudwatch", "dashboard", "log", "metric"]):
         parts.append(INSTRUCTION_PACKS["cloudwatch_alarms"])
+
+    if any(k in goal_text for k in [
+        "ssm", "systemctl", "service", "daemon", "start", "stop", "restart", "host", "command" ,
+    ]):
+        parts.append(INSTRUCTION_PACKS["ssm_execution"])
 
     parts.append("Complete tasks immediately and report what you did.")
     return "\n\n".join(parts)
