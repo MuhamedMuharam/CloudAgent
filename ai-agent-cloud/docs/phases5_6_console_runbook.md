@@ -26,9 +26,9 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
 
 ```bash
 sudo systemctl status redis6.service --no-pager
-sudo systemctl status ai-otel-collector.service --no-pager
-sudo systemctl status ai-real-api.service --no-pager
-sudo systemctl status ai-real-worker.service --no-pager
+sudo systemctl status otel-collector.service --no-pager
+sudo systemctl status real-api.service --no-pager
+sudo systemctl status real-worker.service --no-pager
 ```
 
 ## 4. Functional tests
@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8080/tasks/<task_id>
 ```bash
 tail -n 50 /var/log/ai-agent/app.log
 tail -n 50 /var/log/ai-agent/worker.log
-tail -n 50 /var/log/ai-agent/otel-collector.log
+    tail -n 50 /var/log/ai-agent/otel-collector.log
 ```
 
 ## 6. AWS-side trace validation
@@ -70,4 +70,4 @@ Use these tools from your agent goals:
 - `aws_get_xray_service_graph`
 
 Example intent:
-"Get X-Ray trace summaries for last 15 minutes and identify error traces for ai-real-api"
+"Get X-Ray trace summaries for last 15 minutes and identify error traces for real-api"
