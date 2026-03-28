@@ -83,9 +83,11 @@ if __name__ == "__main__":
    #  7. Associate route tables with appropriate subnets
    #  """
     goal = """
-    Check pending alarm notifications from SQS and triage the latest ALARM for TestWebServer with mitigation steps.
-    """
+    Analyze last 15 minutes traces for real-api and worker task failures, identify root cause from trace details and logs, then provide concrete mitigation steps with priority.
+"""
     # You can also test other goals:
+    #summarize to me the xray map in the last 20 min and check if there is any anomalies for the instance named TestWebServer with id = "i-025c8c399d6f776c4".     """
+
     #summarize to me the diskio section of the metrics last hour for the instance named TestWebServer.
     # Investigate instance named TestWebServer. Check alarms, metrics, and logs. Give me the current state , Identify root cause (if there is a problem) and propose immediate mitigation.
     
