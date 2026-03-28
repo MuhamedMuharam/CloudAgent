@@ -7,7 +7,7 @@ BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
 RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1")
 
 celery_app = Celery(
-    "ai_real_service",
+    "real_service",
     broker=BROKER_URL,
     backend=RESULT_BACKEND,
     include=["tasks"],

@@ -67,6 +67,13 @@ INSTRUCTION_PACKS = {
         "  * 31 to 180 minutes -> 300 seconds\n"
         "  * more than 180 minutes -> 900 seconds or more\n"
         "- If user asks for last hour metrics, explicitly call aws_get_ec2_metrics with period_seconds=300\n"
+        "- Log group routing for incident triage:\n"
+        "  * /ai-agent/app -> real-api request flow, input validation, order submission errors\n"
+        "  * /ai-agent/worker -> Celery task execution, retries/failures, processing latency\n"
+        "  * /ai-agent/otel -> OpenTelemetry collector pipeline/export issues to X-Ray\n"
+        "  * /ai-agent/system -> OS/systemd/network/runtime host-level issues\n"
+        "  * /ai-agent/agent -> alarm_worker and agent orchestration/decision logs\n"
+        "- For root-cause analysis, correlate timestamps across app + worker + otel logs before concluding\n"
     ),
     "ssm_execution": (
         "SSM COMMAND EXECUTION:\n"
@@ -77,6 +84,18 @@ INSTRUCTION_PACKS = {
         "  * a previous command timed out client-side and you need a later/follow-up fetch, or\n"
         "  * you are checking progress of a long-running command\n"
         "- If goal references an instance by name only, resolve it first with aws_list_ec2_instances to obtain instance_id\n"
+    ),
+    "xray_tracing": (
+        "X-RAY TRACE ANALYSIS:\n"
+        "- Prefer aws_get_xray_trace_summaries first, then drill down with aws_get_xray_trace_details when needed\n"
+        "- If the goal includes a service name, pass it via service_names (example: [\"real-api\"])\n"
+        "- Never pass EC2 instance names or instance IDs as service_names\n"
+        "- If goal mentions instance but not service: call aws_get_xray_trace_summaries with exclude_loopback_only=true and no service_names, then use analysis.top_service_names to choose service_names for a second query\n"
+        "- For generic trace requests with no service specified, set exclude_loopback_only=true to avoid localhost-only noise\n"
+        "- Do not assume traces can be filtered by EC2 instance ID directly; X-Ray filtering is service/trace based\n"
+        "- If summaries indicate loopback-only or mostly zero-duration traces, call aws_get_xray_service_graph and/or aws_get_xray_trace_details before concluding\n"
+        "- During mitigation analysis, cross-check X-Ray findings with log groups /ai-agent/app, /ai-agent/worker, and /ai-agent/otel\n"
+        "- In final answers, summarize analysis fields first (fault/error/throttle counts, top services, warnings) before listing raw trace IDs\n"
     ),
 }
 
@@ -92,13 +111,16 @@ def build_system_prompt(goal: str) -> str:
     if "vpc" in goal_text and any(k in goal_text for k in ["delete", "remove", "destroy"]):
         parts.append(INSTRUCTION_PACKS["vpc_deletion"])
 
-    if any(k in goal_text for k in ["alarm", "cloudwatch", "dashboard", "log", "metric"]):
+    if any(k in goal_text for k in ["alarm", "cloudwatch", "dashboard", "log", "metric", "incident", "root cause", "mitigation"]):
         parts.append(INSTRUCTION_PACKS["cloudwatch_alarms"])
 
     if any(k in goal_text for k in [
         "ssm", "systemctl", "service", "daemon", "start", "stop", "restart", "host", "command" ,
     ]):
         parts.append(INSTRUCTION_PACKS["ssm_execution"])
+
+    if any(k in goal_text for k in ["xray", "trace", "tracing", "latency", "fault", "error rate"]):
+        parts.append(INSTRUCTION_PACKS["xray_tracing"])
 
     parts.append("Complete tasks immediately and report what you did.")
     return "\n\n".join(parts)

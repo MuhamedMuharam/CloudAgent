@@ -11,6 +11,7 @@ Run this server with: python mcp_servers/aws_server.py
 import asyncio
 import json
 import os
+import re
 import sys
 
 # Import AWS managers
@@ -609,6 +610,8 @@ async def aws_get_xray_trace_summaries(
     minutes: int = 15,
     max_results: int = 20,
     filter_expression: str = None,
+    service_names: list = None,
+    exclude_loopback_only: bool = False,
 ) -> dict:
     """
     Get recent AWS X-Ray trace summaries.
@@ -617,16 +620,75 @@ async def aws_get_xray_trace_summaries(
         minutes: Lookback window in minutes
         max_results: Maximum trace summaries to return
         filter_expression: Optional X-Ray filter expression
+        service_names: Optional list of service names to include (translated to service("name") filter)
+        exclude_loopback_only: Exclude traces that only contain localhost/127.0.0.1 service names
 
     Returns:
         Dictionary with trace summary list
     """
     try:
+        merged_filter = filter_expression
+        cleaned = []
+        if service_names:
+            cleaned = [str(name).strip() for name in service_names if str(name).strip()]
+            if cleaned:
+                service_filter = " OR ".join(
+                    f'service("{name.replace("\\", "\\\\").replace("\"", "\\\"")}")'
+                    for name in cleaned
+                )
+                merged_filter = f"({merged_filter}) AND ({service_filter})" if merged_filter else service_filter
+
         result = xray_manager.get_trace_summaries(
             minutes=minutes,
             max_results=max_results,
-            filter_expression=filter_expression,
+            filter_expression=merged_filter,
+            exclude_loopback_only=exclude_loopback_only,
         )
+
+        if service_names:
+            result["requested_service_names"] = service_names
+        result["applied_filter_expression"] = merged_filter
+
+        warnings = result.setdefault("analysis", {}).setdefault("warnings", []) if isinstance(result.get("analysis"), dict) else []
+
+        likely_instance_tokens = [
+            name for name in cleaned if re.match(r"^i-[0-9a-f]{8,}$", name.lower())
+        ]
+        if likely_instance_tokens:
+            warnings.append(
+                "Some service_names look like EC2 instance IDs. X-Ray service filters require service names (for example: real-api, real-worker), not instance IDs."
+            )
+
+        if cleaned and result.get("count", 0) == 0:
+            discovery_result = xray_manager.get_trace_summaries(
+                minutes=minutes,
+                max_results=max(max_results, 20),
+                filter_expression=filter_expression,
+                exclude_loopback_only=True,
+            )
+
+            suggested_services = [
+                item.get("name")
+                for item in discovery_result.get("analysis", {}).get("top_service_names", [])
+                if item.get("name")
+            ]
+
+            result["fallback_discovery"] = {
+                "count": discovery_result.get("count", 0),
+                "suggested_service_names": suggested_services,
+                "applied_filter_expression": filter_expression,
+                "exclude_loopback_only": True,
+            }
+
+            if suggested_services:
+                warnings.append(
+                    "No traces matched the requested service_names. Try one of fallback_discovery.suggested_service_names."
+                )
+            else:
+                warnings.append(
+                    "No traces matched requested service_names and fallback discovery also found no non-loopback traces."
+                )
+
         return {
             "success": True,
             "result": result,

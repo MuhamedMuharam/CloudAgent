@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8080/tasks/<task_id>
 ```bash
 tail -n 50 /var/log/ai-agent/app.log
 tail -n 50 /var/log/ai-agent/worker.log
-    tail -n 50 /var/log/ai-agent/otel-collector.log
+tail -n 50 /var/log/ai-agent/otel-collector.log
 ```
 
 ## 6. AWS-side trace validation
