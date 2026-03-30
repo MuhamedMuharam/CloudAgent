@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import importlib
+from logging.config import dictConfig
 from collections import Counter
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -22,11 +23,51 @@ FastAPIInstrumentor = importlib.import_module("opentelemetry.instrumentation.fas
 RedisInstrumentor = importlib.import_module("opentelemetry.instrumentation.redis").RedisInstrumentor
 RedisClient = importlib.import_module("redis").Redis
 
+
+def _configure_logging() -> None:
+    """Configure timestamped logging for app and uvicorn output."""
+    log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+    dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+                    "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                }
+            },
+            "handlers": {
+                "default": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "default",
+                    "stream": "ext://sys.stdout",
+                }
+            },
+            "root": {
+                "handlers": ["default"],
+                "level": log_level,
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": log_level, "propagate": False},
+                "uvicorn.error": {"handlers": ["default"], "level": log_level, "propagate": False},
+                "uvicorn.access": {"handlers": ["default"], "level": log_level, "propagate": False},
+                "real-api": {"handlers": ["default"], "level": log_level, "propagate": False},
+            },
+        }
+    )
+
+
+_configure_logging()
 setup_telemetry(service_name=os.getenv("OTEL_SERVICE_NAME", "real-api"))
 RedisInstrumentor().instrument()
 
 app = FastAPI(title="Real Service API", version="1.0.0")
-FastAPIInstrumentor.instrument_app(app)
+excluded_urls = os.getenv("OTEL_FASTAPI_EXCLUDED_URLS", "/health,/healthz").strip()
+if excluded_urls:
+    FastAPIInstrumentor.instrument_app(app, excluded_urls=excluded_urls)
+else:
+    FastAPIInstrumentor.instrument_app(app)
 
 logger = logging.getLogger("real-api")
 logger.setLevel(logging.INFO)

@@ -5,6 +5,8 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  probabilistic_sampler:
+    sampling_percentage: 20
   batch:
 
 exporters:
@@ -14,5 +16,5 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
+      processors: [probabilistic_sampler, batch]
       exporters: [awsxray]

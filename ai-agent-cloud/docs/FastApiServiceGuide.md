@@ -23,9 +23,10 @@ git pull
 
 sudo rsync -av --delete config/real_service/src/ /opt/real-service/src/
 sudo chown -R ec2-user:ec2-user /opt/real-service/src
+sudo cp config/real_service/otel-collector-config.yaml /opt/real-service/otel-collector-config.yaml
 
 sudo /opt/real-service/venv/bin/pip install -r config/real_service/requirements.txt
-sudo systemctl restart real-api.service real-worker.service
+sudo systemctl restart otel-collector.service real-api.service real-worker.service
 
 # Optional: restart alarm worker if agent prompts/instructions changed
 sudo systemctl restart ai-agent.service

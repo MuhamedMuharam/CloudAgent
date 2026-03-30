@@ -70,6 +70,7 @@ Environment=PYTHONPATH=/opt/real-service/src
 Environment=APP_ENV=dev
 Environment=OTEL_SERVICE_NAME=real-api
 Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+Environment=OTEL_FASTAPI_EXCLUDED_URLS=/health,/healthz
 Environment=CELERY_BROKER_URL=redis://127.0.0.1:6379/0
 Environment=CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/1
 ExecStart=/opt/real-service/venv/bin/uvicorn api:app --host 0.0.0.0 --port 8080
