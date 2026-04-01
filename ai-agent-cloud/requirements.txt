@@ -1,4 +1,4 @@
-python_version >= "3.10"
+# Requires Python 3.10+ (check with: python --version)
 # Core dependencies for AI Agent Cloud Infrastructure
 openai
 python-dotenv
