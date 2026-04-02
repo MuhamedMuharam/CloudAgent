@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+from typing import Dict, List, Set
 from dotenv import load_dotenv  # Load .env file with credentials
 from openai import OpenAI  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
@@ -78,6 +79,8 @@ INSTRUCTION_PACKS = {
     "ssm_execution": (
         "SSM COMMAND EXECUTION:\n"
         "- Prefer aws_ssm_run_command as the default for remote command execution\n"
+        "- Include target_os whenever known (amazon-linux, ubuntu, rhel, etc.) so policy checks can enforce OS-safe commands\n"
+        "- Never run destructive host commands (shutdown/reboot/rm -rf/mkfs) unless user explicitly requests and policy allows\n"
         "- For normal operations, call aws_ssm_run_command with wait_for_completion=true to get stdout/stderr inline\n"
         "- Use aws_ssm_get_command_output only when:\n"
         "  * a command was submitted with wait_for_completion=false, or\n"
@@ -98,6 +101,93 @@ INSTRUCTION_PACKS = {
         "- In final answers, summarize analysis fields first (fault/error/throttle counts, top services, warnings) before listing raw trace IDs\n"
     ),
 }
+
+
+POLICY_DOMAIN_KEYWORDS = {
+    "security_groups": ["security group", "ingress", "egress", "cidr", "firewall", "port"],
+    "ssm": ["ssm", "systemctl", "service", "daemon", "command", "package", "dnf", "yum", "apt"],
+    "ec2": ["ec2", "instance", "autoscaling", "scale", "rightsiz", "cost", "budget"],
+    "vpc": ["vpc", "subnet", "route table", "internet gateway", "igw", "cidr", "network"],
+    "nat_gateway": ["nat", "nat gateway"],
+}
+
+POLICY_DOMAIN_TO_SECTIONS = {
+    "security_groups": ["security_groups"],
+    "ssm": ["ssm"],
+    "ec2": ["ec2", "general"],
+    "vpc": ["vpc", "general"],
+    "nat_gateway": ["nat_gateway", "general"],
+}
+
+
+def infer_policy_domains_from_goal(goal: str) -> List[str]:
+    """Infer which policy domains are relevant for this goal."""
+    goal_text = (goal or "").lower()
+    matched: List[str] = []
+    for domain, keywords in POLICY_DOMAIN_KEYWORDS.items():
+        if any(keyword in goal_text for keyword in keywords):
+            matched.append(domain)
+    return matched
+
+
+def infer_policy_domains_from_tool(tool_name: str) -> Set[str]:
+    """Infer policy domains based on the tool currently being called."""
+    name = (tool_name or "").lower()
+    domains: Set[str] = set()
+
+    if name.startswith("aws_ssm_"):
+        domains.add("ssm")
+    if "security_group" in name:
+        domains.add("security_groups")
+    if "nat_gateway" in name:
+        domains.add("nat_gateway")
+    if any(k in name for k in ["vpc", "subnet", "route", "internet_gateway", "igw"]):
+        domains.add("vpc")
+    if "ec2" in name or "instance" in name:
+        domains.add("ec2")
+
+    return domains
+
+
+def build_policy_discovery_hint(policies: dict) -> str:
+    """Build a tiny policy hint that avoids loading full policy content every run."""
+    if not policies:
+        return "POLICY ENFORCEMENT: No policy file loaded at runtime."
+
+    available_domains = [
+        domain for domain, sections in POLICY_DOMAIN_TO_SECTIONS.items()
+        if any(section in policies for section in sections)
+    ]
+
+    return (
+        "POLICY ENFORCEMENT IS ACTIVE. "
+        "To reduce token usage, full policy content is not preloaded by default. "
+        "Relevant policy sections will be injected only when goal/tool intent requires them.\n"
+        f"Available policy domains: {', '.join(sorted(available_domains))}"
+    )
+
+
+def build_policy_context_for_domains(policies: dict, domains: List[str], reason: str) -> str:
+    """Build a compact policy context for selected domains only."""
+    if not policies:
+        return "No policy content available to inject."
+
+    selected_sections: Dict[str, dict] = {}
+    for domain in domains:
+        for section_name in POLICY_DOMAIN_TO_SECTIONS.get(domain, []):
+            if section_name in policies:
+                selected_sections[section_name] = policies.get(section_name, {})
+
+    if not selected_sections:
+        return (
+            f"POLICY CONTEXT ({reason}): no matching sections found for domains {domains}."
+        )
+
+    return (
+        f"POLICY CONTEXT ({reason}) - selected domains only:\n"
+        f"{json.dumps(selected_sections, indent=2)}\n\n"
+        "Plan and execute actions that comply with these constraints."
+    )
 
 
 def build_system_prompt(goal: str) -> str:
@@ -290,6 +380,9 @@ async def run_agent(goal: str, mcp_servers: list = None):
         actions_taken = []
 
         # Initialize conversation
+        goal_policy_domains = infer_policy_domains_from_goal(goal)
+        injected_policy_domains: Set[str] = set(goal_policy_domains)
+
         messages = [
             {
                 "role": "system",
@@ -297,10 +390,26 @@ async def run_agent(goal: str, mcp_servers: list = None):
             },
             {
                 "role": "system",
+                "content": build_policy_discovery_hint(policy_engine.policies)
+            },
+            {
+                "role": "system",
                 "content": build_capability_catalog(mcp_client)
             },
             {"role": "user", "content": goal}
         ]
+
+        if goal_policy_domains:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": build_policy_context_for_domains(
+                        policy_engine.policies,
+                        goal_policy_domains,
+                        reason="goal_intent",
+                    ),
+                }
+            )
 
         # Deterministic pre-router: preload explicitly requested MCP resources/prompts
         # before the first model turn so the model starts with grounded context.
@@ -379,7 +488,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         
         # Main agent loop
         iteration = 0
-        max_iterations = 5  # Prevent infinite loops (reduced to avoid retries on transient errors)
+        max_iterations = 10  # Prevent infinite loops (reduced to avoid retries on transient errors)
         # actions_taken initialized before pre-router to include preloaded MCP reads
         
         while iteration < max_iterations:
@@ -414,6 +523,24 @@ async def run_agent(goal: str, mcp_servers: list = None):
                         except PolicyViolation as e:
                             # Policy violation - don't execute the tool
                             print(f"❌ POLICY VIOLATION: {e}")
+
+                            violation_domains = infer_policy_domains_from_tool(tool_name)
+                            new_domains = [
+                                domain for domain in sorted(violation_domains)
+                                if domain not in injected_policy_domains
+                            ]
+                            if new_domains:
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": build_policy_context_for_domains(
+                                            policy_engine.policies,
+                                            new_domains,
+                                            reason=f"policy_violation:{tool_name}",
+                                        ),
+                                    }
+                                )
+                                injected_policy_domains.update(new_domains)
                             
                             # Return error to GPT so it knows and can try alternative
                             error_result = json.dumps({

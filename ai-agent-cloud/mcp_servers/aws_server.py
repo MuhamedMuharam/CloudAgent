@@ -341,6 +341,7 @@ async def aws_ssm_run_command(
     comment: str = None,
     timeout_seconds: int = 600,
     working_directory: str = None,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -354,6 +355,7 @@ async def aws_ssm_run_command(
         comment: Optional command description
         timeout_seconds: Command timeout in seconds
         working_directory: Optional working directory on target host
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -412,6 +414,7 @@ async def aws_ssm_get_command_output(command_id: str, instance_id: str) -> dict:
 async def aws_ssm_start_service(
     instance_ids: list,
     service_name: str,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -422,6 +425,7 @@ async def aws_ssm_start_service(
     Args:
         instance_ids: List of EC2 instance IDs
         service_name: Systemd service unit name (e.g., ai-agent.service)
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -452,6 +456,7 @@ async def aws_ssm_start_service(
 async def aws_ssm_stop_service(
     instance_ids: list,
     service_name: str,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -462,6 +467,7 @@ async def aws_ssm_stop_service(
     Args:
         instance_ids: List of EC2 instance IDs
         service_name: Systemd service unit name
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -492,6 +498,7 @@ async def aws_ssm_stop_service(
 async def aws_ssm_restart_service(
     instance_ids: list,
     service_name: str,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -502,6 +509,7 @@ async def aws_ssm_restart_service(
     Args:
         instance_ids: List of EC2 instance IDs
         service_name: Systemd service unit name
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -532,6 +540,7 @@ async def aws_ssm_restart_service(
 async def aws_ssm_get_service_status(
     instance_ids: list,
     service_name: str,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -542,6 +551,7 @@ async def aws_ssm_get_service_status(
     Args:
         instance_ids: List of EC2 instance IDs
         service_name: Systemd service unit name
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -571,6 +581,7 @@ async def aws_ssm_get_service_status(
 @mcp.tool()
 async def aws_ssm_list_running_services(
     instance_id: str,
+    target_os: str = None,
     wait_for_completion: bool = True,
     completion_timeout_seconds: int = 60,
     poll_interval_seconds: int = 2,
@@ -580,6 +591,7 @@ async def aws_ssm_list_running_services(
 
     Args:
         instance_id: EC2 instance ID
+        target_os: Optional OS family hint for policy checks (amazon-linux, ubuntu, rhel, etc.)
         wait_for_completion: When True, waits and returns stdout/stderr inline
         completion_timeout_seconds: Maximum wait time for final command status
         poll_interval_seconds: Poll interval while waiting for completion
@@ -1881,6 +1893,66 @@ async def aws_add_security_group_rule(security_group_id: str, rule: dict) -> dic
         return {
             "success": True,
             "message": f"Rule added to security group successfully",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_edit_security_group_rule(security_group_id: str, old_rule: dict, new_rule: dict) -> dict:
+    """
+    Edit a security group rule by replacing an existing rule with a new one.
+
+    Args:
+        security_group_id: Security group ID to update
+        old_rule: Existing rule definition to remove
+        new_rule: New rule definition to add
+
+    Returns:
+        Dictionary with update status and replacement details
+    """
+    try:
+        result = security_manager.edit_security_group_rule(
+            security_group_id=security_group_id,
+            old_rule=old_rule,
+            new_rule=new_rule,
+        )
+        return {
+            "success": True,
+            "message": "Security group rule updated successfully",
+            "details": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_remove_security_group_rule(security_group_id: str, rule: dict) -> dict:
+    """
+    Remove a single rule from an existing security group.
+
+    Args:
+        security_group_id: Security group ID to remove rule from
+        rule: Rule definition to remove
+
+    Returns:
+        Dictionary with removal status and rule details
+    """
+    try:
+        result = security_manager.remove_security_group_rule(
+            security_group_id=security_group_id,
+            rule=rule,
+        )
+        return {
+            "success": True,
+            "message": "Security group rule removed successfully",
             "details": result
         }
     except Exception as e:

@@ -67,6 +67,8 @@ security_groups:
     - 80 # HTTP
     - 443 # HTTPS
     - 8080 # Alternative HTTP
+  # Enforce that only allowed_public_ports can be exposed to public CIDRs.
+  enforce_public_ingress_port_allowlist: true
 
   # Rule limits
   max_rules_per_group: 50
@@ -76,6 +78,83 @@ security_groups:
 
   # Protocol restrictions
   allowed_protocols: [tcp, udp, icmp]
+
+# SSM Command Guardrails
+ssm:
+  enabled: true
+
+  # Default target OS used when caller omits target_os.
+  default_target_os: amazon-linux-2023
+  allowed_target_oses:
+    [
+      amazon-linux-2023,
+      amazon-linux,
+      rhel,
+      centos,
+      rocky,
+      almalinux,
+      ubuntu,
+      debian,
+      suse,
+    ]
+
+  # Service-management tools in this project rely on systemctl.
+  systemd_supported_oses:
+    [
+      amazon-linux-2023,
+      amazon-linux,
+      rhel,
+      centos,
+      rocky,
+      almalinux,
+      ubuntu,
+      debian,
+      suse,
+    ]
+
+  # Limit SSM blast radius per tool call.
+  max_commands_per_invocation: 8
+  max_command_length: 300
+  max_timeout_seconds: 900
+
+  # If package changes are requested, require explicit target_os from the caller.
+  require_target_os_for_package_changes: false
+
+  # Allowed package managers by OS family.
+  allowed_package_managers_by_os:
+    amazon-linux-2023: [dnf, rpm]
+    amazon-linux: [dnf, yum, rpm]
+    rhel: [dnf, yum, rpm]
+    centos: [dnf, yum, rpm]
+    rocky: [dnf, yum, rpm]
+    almalinux: [dnf, yum, rpm]
+    ubuntu: [apt, apt-get, dpkg]
+    debian: [apt, apt-get, dpkg]
+    suse: [zypper, rpm]
+
+  # Never allow direct operations on critical networking/remote-access services.
+  blocked_service_names:
+    - sshd
+    - network
+    - NetworkManager
+    - systemd-networkd
+    - firewalld
+    - dbus
+
+  # High-risk shell patterns blocked for all OS targets.
+  blocked_command_patterns:
+    - '\\brm\\s+-rf\\s+/(?:\\s|$)'
+    - '\\bmkfs(?:\\.[a-z0-9]+)?\\b'
+    - '\\bdd\\s+if='
+    - '\\bshutdown\\b'
+    - '\\breboot\\b'
+    - '\\bpoweroff\\b'
+    - '\\bhalt\\b'
+    - '\\binit\\s+0\\b'
+    - '\\b(?:apt|apt-get|yum|dnf|zypper|pacman)\\b.*\\b(?:remove|purge|erase|autoremove)\\b'
+    - '\\b(?:apt|apt-get)\\b.*\\b(?:dist-upgrade|full-upgrade)\\b'
+    - '\\bcurl\\b.*\\|\\s*(?:bash|sh)\\b'
+    - '\\bwget\\b.*\\|\\s*(?:bash|sh)\\b'
 
 # NAT Gateway Policies
 nat_gateway:

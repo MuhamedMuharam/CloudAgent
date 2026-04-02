@@ -22,6 +22,38 @@ class SecurityGroupManager:
         self.region = region
         self.ec2_client = boto3.client('ec2', region_name=region)
         self.ec2_resource = boto3.resource('ec2', region_name=region)
+
+    def _build_ip_permission(self, rule: Dict) -> Dict:
+        """
+        Build AWS IpPermission payload from a normalized rule dictionary.
+
+        Args:
+            rule: Rule dict containing protocol/ports/source fields
+
+        Returns:
+            AWS-compatible IpPermission dictionary
+        """
+        protocol = rule.get('protocol', 'tcp')
+        from_port = rule.get('from_port', rule.get('port', 80))
+        to_port = rule.get('to_port', rule.get('port', 80))
+
+        ip_permission = {
+            'IpProtocol': protocol,
+        }
+
+        # Ports are only valid for TCP/UDP in this simplified manager.
+        if protocol in ['tcp', 'udp']:
+            ip_permission['FromPort'] = from_port
+            ip_permission['ToPort'] = to_port
+
+        if 'cidr' in rule and rule['cidr']:
+            ip_permission['IpRanges'] = [{'CidrIp': rule['cidr']}]
+        elif 'source_security_group_id' in rule and rule['source_security_group_id']:
+            ip_permission['UserIdGroupPairs'] = [{'GroupId': rule['source_security_group_id']}]
+        else:
+            ip_permission['IpRanges'] = [{'CidrIp': '0.0.0.0/0'}]
+
+        return ip_permission
     
     def create_security_group(self, vpc_id: str, name: str, description: str, 
                              rules: Optional[List[Dict]] = None,
@@ -77,30 +109,7 @@ class SecurityGroupManager:
             if rules:
                 for rule in rules:
                     rule_type = rule.get('type', 'ingress')
-                    protocol = rule.get('protocol', 'tcp')
-                    from_port = rule.get('from_port', rule.get('port', 80))
-                    to_port = rule.get('to_port', rule.get('port', 80))
-                    
-                    # Build IP permissions
-                    ip_permission = {
-                        'IpProtocol': protocol,
-                    }
-                    
-                    # Add ports for TCP/UDP
-                    if protocol in ['tcp', 'udp']:
-                        ip_permission['FromPort'] = from_port
-                        ip_permission['ToPort'] = to_port
-                    
-                    # Add source (CIDR or security group)
-                    if 'cidr' in rule and rule['cidr']:
-                        ip_permission['IpRanges'] = [{'CidrIp': rule['cidr']}]
-                    elif 'source_security_group_id' in rule and rule['source_security_group_id']:
-                        ip_permission['UserIdGroupPairs'] = [{
-                            'GroupId': rule['source_security_group_id']
-                        }]
-                    else:
-                        # Default to 0.0.0.0/0 if no source specified
-                        ip_permission['IpRanges'] = [{'CidrIp': '0.0.0.0/0'}]
+                    ip_permission = self._build_ip_permission(rule)
                     
                     # Add rule
                     if rule_type == 'ingress':
@@ -158,29 +167,7 @@ class SecurityGroupManager:
         """
         try:
             rule_type = rule.get('type', 'ingress')
-            protocol = rule.get('protocol', 'tcp')
-            from_port = rule.get('from_port', rule.get('port', 80))
-            to_port = rule.get('to_port', rule.get('port', 80))
-            
-            # Build IP permissions
-            ip_permission = {
-                'IpProtocol': protocol,
-            }
-            
-            # Add ports for TCP/UDP
-            if protocol in ['tcp', 'udp']:
-                ip_permission['FromPort'] = from_port
-                ip_permission['ToPort'] = to_port
-            
-            # Add source
-            if 'cidr' in rule and rule['cidr']:
-                ip_permission['IpRanges'] = [{'CidrIp': rule['cidr']}]
-            elif 'source_security_group_id' in rule and rule['source_security_group_id']:
-                ip_permission['UserIdGroupPairs'] = [{
-                    'GroupId': rule['source_security_group_id']
-                }]
-            else:
-                ip_permission['IpRanges'] = [{'CidrIp': '0.0.0.0/0'}]
+            ip_permission = self._build_ip_permission(rule)
             
             # Add rule
             if rule_type == 'ingress':
@@ -204,6 +191,90 @@ class SecurityGroupManager:
         
         except ClientError as e:
             error_msg = f"Failed to add security group rule: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def remove_security_group_rule(self, security_group_id: str, rule: Dict) -> Dict:
+        """
+        Remove a single rule from an existing security group.
+
+        Args:
+            security_group_id: Security group ID
+            rule: Rule dict (same format as add_security_group_rule)
+
+        Returns:
+            Dictionary with removed rule details
+        """
+        try:
+            rule_type = rule.get('type', 'ingress')
+            ip_permission = self._build_ip_permission(rule)
+
+            if rule_type == 'ingress':
+                self.ec2_client.revoke_security_group_ingress(
+                    GroupId=security_group_id,
+                    IpPermissions=[ip_permission]
+                )
+            else:
+                self.ec2_client.revoke_security_group_egress(
+                    GroupId=security_group_id,
+                    IpPermissions=[ip_permission]
+                )
+
+            print(f"[SUCCESS] Removed {rule_type} rule from security group {security_group_id}", file=sys.stderr)
+
+            return {
+                'security_group_id': security_group_id,
+                'rule_type': rule_type,
+                'removed_rule': rule
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to remove security group rule: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
+    def edit_security_group_rule(self, security_group_id: str, old_rule: Dict, new_rule: Dict) -> Dict:
+        """
+        Edit a security group rule by replacing an existing rule with a new one.
+
+        Args:
+            security_group_id: Security group ID
+            old_rule: Existing rule to remove
+            new_rule: New rule to add
+
+        Returns:
+            Dictionary with replacement details
+        """
+        try:
+            self.remove_security_group_rule(security_group_id=security_group_id, rule=old_rule)
+
+            try:
+                self.add_security_group_rule(security_group_id=security_group_id, rule=new_rule)
+            except Exception as add_error:
+                # Best-effort rollback to avoid leaving SG without the original rule.
+                rollback_status = "rollback_skipped"
+                try:
+                    self.add_security_group_rule(security_group_id=security_group_id, rule=old_rule)
+                    rollback_status = "rollback_succeeded"
+                except Exception:
+                    rollback_status = "rollback_failed"
+
+                raise Exception(
+                    f"Failed to add new rule after removing old rule: {add_error}. "
+                    f"Rollback status: {rollback_status}."
+                )
+
+            print(f"[SUCCESS] Replaced rule in security group {security_group_id}", file=sys.stderr)
+
+            return {
+                'security_group_id': security_group_id,
+                'old_rule': old_rule,
+                'new_rule': new_rule,
+                'status': 'updated'
+            }
+
+        except Exception as e:
+            error_msg = f"Failed to edit security group rule: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
     
