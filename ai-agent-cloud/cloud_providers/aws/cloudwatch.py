@@ -591,7 +591,9 @@ class CloudWatchManager:
             List of alarm summaries
         """
         try:
-            params = {"MaxRecords": max_records}
+            # CloudWatch DescribeAlarms accepts MaxRecords in range [1, 100].
+            safe_max_records = max(1, min(int(max_records), 100))
+            params = {"MaxRecords": safe_max_records}
             if state_value:
                 params["StateValue"] = state_value
             if alarm_name_prefix:
@@ -607,6 +609,11 @@ class CloudWatchManager:
                         "alarm_description": alarm.get("AlarmDescription"),
                         "state_value": alarm.get("StateValue"),
                         "state_reason": alarm.get("StateReason"),
+                        "state_updated_timestamp": (
+                            alarm.get("StateUpdatedTimestamp").isoformat()
+                            if alarm.get("StateUpdatedTimestamp")
+                            else None
+                        ),
                         "metric_name": alarm.get("MetricName"),
                         "namespace": alarm.get("Namespace"),
                         "dimensions": [
@@ -708,3 +715,94 @@ class CloudWatchManager:
             error_msg = f"Failed to get dashboard: {e}"
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
+
+    def analyze_ec2_rightsizing(
+        self,
+        instance_id: str,
+        minutes: int = 180,
+        period_seconds: int = 300,
+        cpu_idle_threshold_percent: float = 15.0,
+        cpu_hot_threshold_percent: float = 70.0,
+        network_idle_threshold_bytes_per_period: float = 50000.0,
+    ) -> Dict:
+        """
+        Analyze EC2 utilization to produce a rightsizing recommendation signal.
+        """
+        metrics_payload = self.get_ec2_metrics(
+            instance_id=instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+            include_agent_metrics=False,
+        )
+        metrics = metrics_payload.get('metrics', {})
+
+        cpu_values = self._extract_metric_values(metrics, 'CPUUtilization')
+        network_in_values = self._extract_metric_values(metrics, 'NetworkIn')
+        network_out_values = self._extract_metric_values(metrics, 'NetworkOut')
+
+        cpu_avg = self._safe_avg(cpu_values)
+        cpu_max = max(cpu_values) if cpu_values else None
+        network_in_avg = self._safe_avg(network_in_values)
+        network_out_avg = self._safe_avg(network_out_values)
+        network_total_avg = None
+        if network_in_avg is not None and network_out_avg is not None:
+            network_total_avg = network_in_avg + network_out_avg
+
+        recommendation = 'investigate'
+        reason = 'Insufficient signal to classify utilization trend.'
+
+        if cpu_avg is not None and network_total_avg is not None:
+            if cpu_avg <= cpu_idle_threshold_percent and network_total_avg <= network_idle_threshold_bytes_per_period:
+                recommendation = 'downsize'
+                reason = (
+                    f"Low utilization detected: avg CPU {cpu_avg:.2f}% and avg network "
+                    f"{network_total_avg:.2f} bytes/period"
+                )
+            elif cpu_avg >= cpu_hot_threshold_percent:
+                recommendation = 'upsize'
+                reason = f"High utilization detected: avg CPU {cpu_avg:.2f}%"
+            else:
+                recommendation = 'keep'
+                reason = f"Utilization appears balanced: avg CPU {cpu_avg:.2f}%"
+
+        return {
+            'instance_id': instance_id,
+            'window_minutes': minutes,
+            'period_seconds': period_seconds,
+            'metrics_summary': {
+                'cpu_avg_percent': cpu_avg,
+                'cpu_max_percent': cpu_max,
+                'network_in_avg_bytes_per_period': network_in_avg,
+                'network_out_avg_bytes_per_period': network_out_avg,
+                'network_total_avg_bytes_per_period': network_total_avg,
+                'datapoint_count': {
+                    'cpu': len(cpu_values),
+                    'network_in': len(network_in_values),
+                    'network_out': len(network_out_values),
+                },
+            },
+            'thresholds': {
+                'cpu_idle_threshold_percent': cpu_idle_threshold_percent,
+                'cpu_hot_threshold_percent': cpu_hot_threshold_percent,
+                'network_idle_threshold_bytes_per_period': network_idle_threshold_bytes_per_period,
+            },
+            'recommendation': recommendation,
+            'reason': reason,
+        }
+
+    @staticmethod
+    def _extract_metric_values(metrics_payload: Dict, metric_name: str) -> List[float]:
+        metric_item = metrics_payload.get(metric_name, {}) if isinstance(metrics_payload, dict) else {}
+        datapoints = metric_item.get('datapoints', []) if isinstance(metric_item, dict) else []
+        values = []
+        for dp in datapoints:
+            value = dp.get('value')
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        return values
+
+    @staticmethod
+    def _safe_avg(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        return sum(values) / len(values)

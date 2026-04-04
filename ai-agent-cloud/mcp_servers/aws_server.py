@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 
 # Import AWS managers
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -158,7 +159,13 @@ async def aws_list_ec2_instances(tag_filter: dict = None) -> dict:
 
 
 @mcp.tool()
-async def aws_create_ec2_instance(name: str, cpu: int = 2, ram: int = 4) -> dict:
+async def aws_create_ec2_instance(
+    name: str,
+    cpu: int = 2,
+    ram: int = 4,
+    tags: dict = None,
+    instance_type: str = None,
+) -> dict:
     """
     Create a new EC2 instance with specified resources.
     Automatically selects appropriate instance type based on CPU/RAM.
@@ -168,12 +175,20 @@ async def aws_create_ec2_instance(name: str, cpu: int = 2, ram: int = 4) -> dict
         name: Name for the EC2 instance
         cpu: Number of virtual CPU cores (default: 2)
         ram: RAM in gigabytes (default: 4)
+        tags: Optional tags for policy/budget attribution (Environment, Project, etc.)
+        instance_type: Optional explicit instance type override
     
     Returns:
         Dictionary with success status, message, and instance details
     """
     try:
-        instance = ec2_manager.create_instance(name=name, cpu=cpu, ram=ram)
+        instance = ec2_manager.create_instance(
+            name=name,
+            cpu=cpu,
+            ram=ram,
+            tags=tags,
+            instance_type=instance_type,
+        )
         return {
             "success": True,
             "message": f"EC2 instance '{name}' created successfully",
@@ -331,6 +346,533 @@ async def aws_get_ec2_instance_ssm_status(instance_id: str) -> dict:
         return {
             "success": False,
             "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_analyze_ec2_cost_optimization(
+    instance_id: str,
+    minutes: int = 180,
+    period_seconds: int = 300,
+    cpu_idle_threshold_percent: float = 15.0,
+    cpu_hot_threshold_percent: float = 70.0,
+    network_idle_threshold_bytes_per_period: float = 50000.0,
+    allowed_families: list = None,
+    include_compute_optimizer: bool = True,
+) -> dict:
+    """
+    Analyze a single EC2 instance for cost optimization and rightsizing.
+
+    Recommendation-only tool by design. It does not mutate infrastructure.
+    """
+    try:
+        utilization = cloudwatch_manager.analyze_ec2_rightsizing(
+            instance_id=instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+            cpu_idle_threshold_percent=cpu_idle_threshold_percent,
+            cpu_hot_threshold_percent=cpu_hot_threshold_percent,
+            network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+        )
+
+        cheapest = ec2_manager.get_cheapest_compatible_instance_type(
+            instance_id=instance_id,
+            allowed_families=allowed_families,
+            prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
+        )
+
+        compute_optimizer = None
+        if include_compute_optimizer:
+            try:
+                compute_optimizer = ec2_manager.get_compute_optimizer_recommendations()
+            except Exception as compute_opt_error:
+                compute_optimizer = {"error": str(compute_opt_error)}
+
+        return {
+            "success": True,
+            "instance_id": instance_id,
+            "analysis_mode": "recommendation_only",
+            "utilization_analysis": utilization,
+            "agent_attribute_based_recommendation": cheapest,
+            "compute_optimizer": compute_optimizer,
+            "estimated_hourly_savings": cheapest.get('estimated_hourly_savings', 0.0),
+            "estimated_monthly_savings": cheapest.get('estimated_monthly_savings', 0.0),
+            "next_action_hint": (
+                "If user explicitly requests execution, call aws_resize_ec2_instance "
+                "with create_backup=true."
+            ),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_analyze_ec2_fleet_cost_optimization(
+    minutes: int = 180,
+    period_seconds: int = 300,
+    cpu_idle_threshold_percent: float = 15.0,
+    cpu_hot_threshold_percent: float = 70.0,
+    network_idle_threshold_bytes_per_period: float = 50000.0,
+    allowed_families: list = None,
+    max_instances: int = 50,
+) -> dict:
+    """
+    Analyze multiple running EC2 instances and produce recommendation-only rightsizing output.
+    """
+    try:
+        instances = ec2_manager.list_instances()
+        running_instances = [inst for inst in instances if inst.get('state') == 'running'][:max_instances]
+
+        analyses = []
+        total_hourly_savings = 0.0
+        total_monthly_savings = 0.0
+
+        for inst in running_instances:
+            instance_id = inst.get('id')
+            utilization = cloudwatch_manager.analyze_ec2_rightsizing(
+                instance_id=instance_id,
+                minutes=minutes,
+                period_seconds=period_seconds,
+                cpu_idle_threshold_percent=cpu_idle_threshold_percent,
+                cpu_hot_threshold_percent=cpu_hot_threshold_percent,
+                network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+            )
+            cheapest = ec2_manager.get_cheapest_compatible_instance_type(
+                instance_id=instance_id,
+                allowed_families=allowed_families,
+                prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
+            )
+
+            hourly_savings = float(cheapest.get('estimated_hourly_savings', 0.0) or 0.0)
+            monthly_savings = float(cheapest.get('estimated_monthly_savings', 0.0) or 0.0)
+            total_hourly_savings += hourly_savings
+            total_monthly_savings += monthly_savings
+
+            analyses.append(
+                {
+                    'instance_id': instance_id,
+                    'instance_name': inst.get('name'),
+                    'current_instance_type': inst.get('type'),
+                    'utilization_analysis': utilization,
+                    'recommendation': cheapest,
+                }
+            )
+
+        return {
+            'success': True,
+            'analysis_mode': 'recommendation_only',
+            'instance_count': len(analyses),
+            'instances': analyses,
+            'estimated_hourly_savings': total_hourly_savings,
+            'estimated_monthly_savings': total_monthly_savings,
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+        }
+
+
+@mcp.tool()
+async def aws_get_compute_optimizer_recommendations(instance_arns: list = None) -> dict:
+    """
+    Fetch EC2 rightsizing recommendations from AWS Compute Optimizer.
+
+    This is recommendation-only and does not change infrastructure.
+    """
+    try:
+        result = ec2_manager.get_compute_optimizer_recommendations(instance_arns=instance_arns)
+        return {
+            "success": True,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_resize_ec2_instance(
+    instance_id: str,
+    target_instance_type: str = None,
+    min_cpu: int = None,
+    min_ram_gb: int = None,
+    allowed_families: list = None,
+    create_backup: bool = True,
+    backup_name_prefix: str = 'ai-agent-resize-backup',
+    dry_run: bool = True,
+    no_reboot_backup: bool = True,
+    prefer_downsize_when_idle: bool = True,
+) -> dict:
+    """
+    Resize an EC2 instance safely with compatibility checks and optional AMI backup.
+
+    If target_instance_type is omitted, uses attribute-based cheapest-instance selection.
+    """
+    try:
+        selection = None
+        resolved_target_type = target_instance_type
+
+        if not resolved_target_type:
+            selection = ec2_manager.get_cheapest_compatible_instance_type(
+                instance_id=instance_id,
+                min_cpu=min_cpu,
+                min_ram_gb=min_ram_gb,
+                allowed_families=allowed_families,
+                prefer_downsize_when_idle=prefer_downsize_when_idle,
+            )
+            resolved_target_type = selection.get('recommended_instance_type')
+
+        if dry_run:
+            compatibility = None
+            try:
+                current = ec2_manager.get_instance_status(instance_id)
+                compatibility = ec2_manager.get_instance_type_compatibility(
+                    current.get('type'),
+                    resolved_target_type,
+                )
+            except Exception:
+                pass
+
+            dry_run_payload = {
+                "success": True,
+                "mode": "dry_run",
+                "instance_id": instance_id,
+                "target_instance_type": resolved_target_type,
+                "selection": selection,
+                "compatibility": compatibility,
+                "backup_will_be_created": create_backup,
+                "message": "Dry-run only. No infrastructure changes were applied.",
+            }
+            if selection:
+                dry_run_payload["estimated_hourly_savings"] = selection.get('estimated_hourly_savings', 0.0)
+                dry_run_payload["estimated_monthly_savings"] = selection.get('estimated_monthly_savings', 0.0)
+            return dry_run_payload
+
+        result = ec2_manager.resize_instance_type(
+            instance_id=instance_id,
+            target_instance_type=resolved_target_type,
+            create_backup=create_backup,
+            backup_name_prefix=backup_name_prefix,
+            no_reboot_backup=no_reboot_backup,
+        )
+
+        return {
+            "success": True,
+            "mode": "applied",
+            "result": result,
+            "estimated_hourly_savings": result.get('estimated_hourly_savings', 0.0),
+            "estimated_monthly_savings": result.get('estimated_monthly_savings', 0.0),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_apply_ec2_rightsizing(
+    instance_id: str,
+    min_cpu: int = None,
+    min_ram_gb: int = None,
+    allowed_families: list = None,
+    create_backup: bool = True,
+    backup_name_prefix: str = 'ai-agent-resize-backup',
+    no_reboot_backup: bool = True,
+    prefer_downsize_when_idle: bool = True,
+    minutes: int = 180,
+    period_seconds: int = 300,
+) -> dict:
+    """
+    Smart apply wrapper:
+    - Re-analyzes utilization
+    - Chooses most suitable compatible target with cost savings
+    - Applies resize only when there is a positive savings opportunity
+    """
+    try:
+        utilization = cloudwatch_manager.analyze_ec2_rightsizing(
+            instance_id=instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+        )
+
+        current = ec2_manager.get_instance_status(instance_id)
+        current_type = current.get('type')
+        current_specs = ec2_manager.get_cheapest_compatible_instance_type(
+            instance_id=instance_id,
+            min_cpu=None,
+            min_ram_gb=None,
+            allowed_families=allowed_families,
+            prefer_downsize_when_idle=False,
+        )
+
+        # If the model auto-fills min constraints equal to current shape, relax them in downsize flows.
+        effective_min_cpu = min_cpu
+        effective_min_ram = min_ram_gb
+        if utilization.get('recommendation') == 'downsize':
+            if (
+                min_cpu is not None
+                and min_ram_gb is not None
+                and int(min_cpu) >= int(current_specs.get('required_cpu', min_cpu))
+                and int(min_ram_gb) >= int(current_specs.get('required_ram_gb', min_ram_gb))
+            ):
+                effective_min_cpu = None
+                effective_min_ram = None
+
+        selection = ec2_manager.get_cheapest_compatible_instance_type(
+            instance_id=instance_id,
+            min_cpu=effective_min_cpu,
+            min_ram_gb=effective_min_ram,
+            allowed_families=allowed_families,
+            prefer_downsize_when_idle=(prefer_downsize_when_idle and utilization.get('recommendation') == 'downsize'),
+        )
+        target_type = selection.get('recommended_instance_type')
+        hourly_savings = float(selection.get('estimated_hourly_savings', 0.0) or 0.0)
+
+        if not target_type or target_type == current_type:
+            return {
+                'success': True,
+                'mode': 'no_change',
+                'message': 'No better compatible target instance type found.',
+                'instance_id': instance_id,
+                'current_instance_type': current_type,
+                'selection': selection,
+                'utilization_analysis': utilization,
+            }
+
+        if hourly_savings <= 0:
+            return {
+                'success': True,
+                'mode': 'no_change',
+                'message': 'Recommended target does not provide positive savings. Resize skipped.',
+                'instance_id': instance_id,
+                'current_instance_type': current_type,
+                'target_instance_type': target_type,
+                'selection': selection,
+                'utilization_analysis': utilization,
+                'estimated_hourly_savings': hourly_savings,
+                'estimated_monthly_savings': float(selection.get('estimated_monthly_savings', 0.0) or 0.0),
+            }
+
+        result = ec2_manager.resize_instance_type(
+            instance_id=instance_id,
+            target_instance_type=target_type,
+            create_backup=create_backup,
+            backup_name_prefix=backup_name_prefix,
+            no_reboot_backup=no_reboot_backup,
+        )
+
+        return {
+            'success': True,
+            'mode': 'applied',
+            'result': result,
+            'selection': selection,
+            'utilization_analysis': utilization,
+            'estimated_hourly_savings': result.get('estimated_hourly_savings', 0.0),
+            'estimated_monthly_savings': result.get('estimated_monthly_savings', 0.0),
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+        }
+
+
+@mcp.tool()
+async def aws_detect_idle_cost_leaks(
+    minutes: int = 180,
+    period_seconds: int = 300,
+    cpu_idle_threshold_percent: float = 10.0,
+    network_idle_threshold_bytes_per_period: float = 25000.0,
+    stale_alarm_days: int = 30,
+    include_fleet_cost_analysis: bool = True,
+    allowed_families: list = None,
+    max_instances: int = 50,
+) -> dict:
+    """
+    Detect lightweight cost leaks in small environments and provide
+    a system-wide recommendation-only fleet cost analysis:
+    - idle running EC2 instances
+    - potentially stale CloudWatch alarms
+    - fleet rightsizing opportunities and estimated savings
+    """
+    try:
+        instances = ec2_manager.list_instances()
+        running_instances = [instance for instance in instances if instance.get('state') == 'running']
+
+        idle_instances = []
+        utilization_by_instance_id = {}
+        for instance in running_instances:
+            instance_id = instance.get('id')
+            analysis = cloudwatch_manager.analyze_ec2_rightsizing(
+                instance_id=instance_id,
+                minutes=minutes,
+                period_seconds=period_seconds,
+                cpu_idle_threshold_percent=cpu_idle_threshold_percent,
+                network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+            )
+            utilization_by_instance_id[instance_id] = analysis
+            if analysis.get('recommendation') == 'downsize':
+                idle_instances.append(
+                    {
+                        'instance_id': instance_id,
+                        'instance_name': instance.get('name'),
+                        'instance_type': instance.get('type'),
+                        'analysis': analysis,
+                    }
+                )
+
+        warnings = []
+        stale_alarm_error = None
+
+        try:
+            alarms = cloudwatch_manager.list_alarms(max_records=100)
+        except Exception as alarm_error:
+            alarms = []
+            stale_alarm_error = str(alarm_error)
+            warnings.append(
+                "CloudWatch alarm stale analysis was skipped due to an alarm API error. "
+                "Idle EC2 analysis is still valid."
+            )
+
+        stale_alarms = []
+        now = datetime.now(timezone.utc)
+        for alarm in alarms:
+            ts_raw = alarm.get('state_updated_timestamp')
+            if not ts_raw:
+                continue
+            try:
+                state_updated = datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+            except Exception:
+                continue
+
+            age_days = (now - state_updated).days
+            if age_days >= stale_alarm_days:
+                stale_alarms.append(
+                    {
+                        'alarm_name': alarm.get('alarm_name'),
+                        'state_value': alarm.get('state_value'),
+                        'state_updated_timestamp': ts_raw,
+                        'age_days': age_days,
+                    }
+                )
+
+        fleet_cost_analysis = None
+        if include_fleet_cost_analysis:
+            analyzed_instances = running_instances[:max(1, int(max_instances))]
+            analyses = []
+            total_hourly_savings = 0.0
+            total_monthly_savings = 0.0
+            actionable_recommendations_count = 0
+            low_confidence_instances = []
+
+            for instance in analyzed_instances:
+                instance_id = instance.get('id')
+                utilization = utilization_by_instance_id.get(instance_id)
+                if not utilization:
+                    utilization = cloudwatch_manager.analyze_ec2_rightsizing(
+                        instance_id=instance_id,
+                        minutes=minutes,
+                        period_seconds=period_seconds,
+                        cpu_idle_threshold_percent=cpu_idle_threshold_percent,
+                        network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+                    )
+
+                recommendation = ec2_manager.get_cheapest_compatible_instance_type(
+                    instance_id=instance_id,
+                    allowed_families=allowed_families,
+                    prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
+                )
+
+                hourly_savings = float(recommendation.get('estimated_hourly_savings', 0.0) or 0.0)
+                monthly_savings = float(recommendation.get('estimated_monthly_savings', 0.0) or 0.0)
+                total_hourly_savings += hourly_savings
+                total_monthly_savings += monthly_savings
+
+                current_type = instance.get('type')
+                target_type = recommendation.get('recommended_instance_type')
+                if target_type and target_type != current_type and hourly_savings > 0:
+                    actionable_recommendations_count += 1
+
+                datapoint_count = utilization.get('metrics_summary', {}).get('datapoint_count', {})
+                min_points = min(
+                    int(datapoint_count.get('cpu', 0) or 0),
+                    int(datapoint_count.get('network_in', 0) or 0),
+                    int(datapoint_count.get('network_out', 0) or 0),
+                )
+                if min_points < 3:
+                    low_confidence_instances.append(
+                        {
+                            'instance_id': instance_id,
+                            'instance_name': instance.get('name'),
+                            'datapoint_count': datapoint_count,
+                        }
+                    )
+
+                analyses.append(
+                    {
+                        'instance_id': instance_id,
+                        'instance_name': instance.get('name'),
+                        'current_instance_type': current_type,
+                        'utilization_analysis': utilization,
+                        'recommendation': recommendation,
+                    }
+                )
+
+            if low_confidence_instances:
+                warnings.append(
+                    'Some instances have very few datapoints (<3). Rightsizing confidence is low for those instances.'
+                )
+
+            fleet_cost_analysis = {
+                'analysis_mode': 'recommendation_only',
+                'scope': 'system_running_ec2_instances',
+                'instance_count': len(analyses),
+                'instances': analyses,
+                'estimated_hourly_savings': total_hourly_savings,
+                'estimated_monthly_savings': total_monthly_savings,
+                'actionable_recommendations_count': actionable_recommendations_count,
+                'low_confidence_instances': low_confidence_instances,
+            }
+
+        final_recommendation = (
+            'Review idle instances and stale alarms first. Resize/stop only after explicit user approval.'
+        )
+        if fleet_cost_analysis:
+            if fleet_cost_analysis.get('actionable_recommendations_count', 0) > 0:
+                final_recommendation = (
+                    'System-wide analysis found cost optimization opportunities. '
+                    'Review fleet_cost_analysis.instances and apply changes only with explicit user approval.'
+                )
+            else:
+                final_recommendation = (
+                    'No actionable rightsizing changes with positive savings were found in the analyzed fleet. '
+                    'Continue periodic monitoring.'
+                )
+
+        return {
+            'success': True,
+            'window_minutes': minutes,
+            'running_instances_count': len(running_instances),
+            'idle_instances_count': len(idle_instances),
+            'idle_instances': idle_instances,
+            'stale_alarms_count': len(stale_alarms),
+            'stale_alarms': stale_alarms,
+            'stale_alarm_error': stale_alarm_error,
+            'warnings': warnings,
+            'fleet_cost_analysis': fleet_cost_analysis,
+            'recommendation': final_recommendation,
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
         }
 
 
@@ -1457,7 +1999,12 @@ async def aws_create_internet_gateway(vpc_id: str, name: str, tags: dict = None)
 
 
 @mcp.tool()
-async def aws_create_nat_gateway(subnet_id: str, name: str, tags: dict = None) -> dict:
+async def aws_create_nat_gateway(
+    subnet_id: str,
+    name: str,
+    tags: dict = None,
+    justification: str = None,
+) -> dict:
     """
     Create a NAT Gateway in a public subnet.
     NAT Gateways enable internet access for instances in private subnets.
@@ -1467,6 +2014,7 @@ async def aws_create_nat_gateway(subnet_id: str, name: str, tags: dict = None) -
         subnet_id: Public subnet ID to place NAT Gateway in
         name: Name tag for the NAT Gateway
         tags: Optional additional tags
+        justification: Optional reason for creating NAT (used by policy engine)
     
     Returns:
         Dictionary with NAT Gateway details including nat_gateway_id and public_ip

@@ -33,6 +33,7 @@ BASE_SYSTEM_PROMPT = (
     "Think step-by-step, call tools when needed, and do not ask the user for operational steps unless blocked.\n\n"
     "GENERAL RULES:\n"
     "- Prefer cost-efficient resources unless explicitly asked otherwise\n"
+    "- For cost-optimization tasks, default to recommendation-only analysis unless the user explicitly asks to execute changes\n"
     "- Validate assumptions by calling tools before concluding\n"
     "- If user asks for an MCP resource URI (aws://...), call read_mcp_resource instead of passing URI to AWS API tools\n"
     "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
@@ -100,13 +101,22 @@ INSTRUCTION_PACKS = {
         "- During mitigation analysis, cross-check X-Ray findings with log groups /ai-agent/app, /ai-agent/worker, and /ai-agent/otel\n"
         "- In final answers, summarize analysis fields first (fault/error/throttle counts, top services, warnings) before listing raw trace IDs\n"
     ),
+    "cost_optimization": (
+        "COST OPTIMIZATION MODE:\n"
+        "- If no explicit execution intent is present, provide recommendations, rationale, and projected savings only\n"
+        "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
+        "- In execution mode, run aws_resize_ec2_instance with dry_run=true first to validate compatibility and target choice\n"
+        "- Apply with aws_apply_ec2_rightsizing only when compatibility is true and estimated_hourly_savings is positive\n"
+        "- For resize actions, require compatibility checks and backup plan before changes\n"
+        "- When calling aws_apply_ec2_rightsizing, do not set min_cpu/min_ram_gb unless the user explicitly asked for hard minimum capacity\n"
+    ),
 }
 
 
 POLICY_DOMAIN_KEYWORDS = {
     "security_groups": ["security group", "ingress", "egress", "cidr", "firewall", "port"],
     "ssm": ["ssm", "systemctl", "service", "daemon", "command", "package", "dnf", "yum", "apt"],
-    "ec2": ["ec2", "instance", "autoscaling", "scale", "rightsiz", "cost", "budget"],
+    "ec2": ["ec2", "instance", "autoscaling", "scale", "rightsiz", "cost", "budget", "compute optimizer", "cheapest"],
     "vpc": ["vpc", "subnet", "route table", "internet gateway", "igw", "cidr", "network"],
     "nat_gateway": ["nat", "nat gateway"],
 }
@@ -114,9 +124,9 @@ POLICY_DOMAIN_KEYWORDS = {
 POLICY_DOMAIN_TO_SECTIONS = {
     "security_groups": ["security_groups"],
     "ssm": ["ssm"],
-    "ec2": ["ec2", "general"],
+    "ec2": ["ec2", "general", "cost_optimization"],
     "vpc": ["vpc", "general"],
-    "nat_gateway": ["nat_gateway", "general"],
+    "nat_gateway": ["nat_gateway", "general", "cost_optimization"],
 }
 
 
@@ -212,6 +222,9 @@ def build_system_prompt(goal: str) -> str:
     if any(k in goal_text for k in ["xray", "trace", "tracing", "latency", "fault", "error rate"]):
         parts.append(INSTRUCTION_PACKS["xray_tracing"])
 
+    if any(k in goal_text for k in ["cost", "optimiz", "rightsiz", "saving", "cheapest", "compute optimizer"]):
+        parts.append(INSTRUCTION_PACKS["cost_optimization"])
+
     parts.append("Complete tasks immediately and report what you did.")
     return "\n\n".join(parts)
 
@@ -251,6 +264,41 @@ def find_prompt_mentions(goal: str, prompt_names: list) -> list:
     """Find prompt names explicitly mentioned in user goal."""
     goal_lc = (goal or "").lower()
     return [name for name in prompt_names if name.lower() in goal_lc]
+
+
+def is_cost_optimization_goal(goal: str) -> bool:
+    goal_lc = (goal or "").lower()
+    return any(
+        keyword in goal_lc
+        for keyword in [
+            'cost optimization',
+            'cost',
+            'rightsiz',
+            'optimiz',
+            'cheapest',
+            'compute optimizer',
+            'save money',
+            'savings',
+        ]
+    )
+
+
+def has_explicit_execution_intent(goal: str) -> bool:
+    goal_lc = (goal or "").lower()
+    return any(
+        token in goal_lc
+        for token in [
+            'take action',
+            'apply',
+            'execute',
+            'do it',
+            'perform',
+            'implement',
+            'resize now',
+            'fix it now',
+            'change it',
+        ]
+    )
 
 
 async def run_agent(goal: str, mcp_servers: list = None):
@@ -378,6 +426,9 @@ async def run_agent(goal: str, mcp_servers: list = None):
         
         # Track actions for this goal
         actions_taken = []
+        cost_goal = is_cost_optimization_goal(goal)
+        explicit_execution_intent = has_explicit_execution_intent(goal)
+        recommendation_only_cost_mode = cost_goal and not explicit_execution_intent
 
         # Initialize conversation
         goal_policy_domains = infer_policy_domains_from_goal(goal)
@@ -398,6 +449,27 @@ async def run_agent(goal: str, mcp_servers: list = None):
             },
             {"role": "user", "content": goal}
         ]
+
+        if recommendation_only_cost_mode:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "EXECUTION INTENT: recommendation-only for cost optimization. "
+                        "Do not execute mutating optimization actions unless the user explicitly asks."
+                    ),
+                }
+            )
+        elif cost_goal and explicit_execution_intent:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "EXECUTION INTENT: user explicitly requested applying optimization actions. "
+                        "If analysis indicates safe savings, execute the action flow and report outcome."
+                    ),
+                }
+            )
 
         if goal_policy_domains:
             messages.append(
@@ -496,7 +568,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
             
             # Call OpenAI with available tools
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4.1-mini",
                 messages=messages,
                 tools=tools,
                 tool_choice="auto"
@@ -517,9 +589,45 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     print(f"   Arguments: {json.dumps(args, indent=6)}")
                     
                     try:
+                        if recommendation_only_cost_mode and tool_name in {
+                            'aws_resize_ec2_instance',
+                            'aws_apply_ec2_rightsizing',
+                            'aws_stop_ec2_instance',
+                            'aws_delete_ec2_instance',
+                        }:
+                            blocked_msg = (
+                                "Recommendation-only mode is active for this cost optimization goal. "
+                                "User did not explicitly request execution of mutating actions."
+                            )
+                            print(f"⚠️  {blocked_msg}")
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps({"success": False, "error": blocked_msg}),
+                            })
+                            continue
+
                         # STEP 1: Validate action against policies (BEFORE execution)
                         try:
                             policy_engine.validate_action(tool_name, args)
+
+                            policy_recommendations = policy_engine.pop_policy_recommendations()
+                            if policy_recommendations:
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "POLICY RECOMMENDATIONS (non-blocking):\n"
+                                            f"{json.dumps(policy_recommendations, indent=2)}\n"
+                                            "Prefer the most cost-safe compliant path unless user explicitly asks otherwise."
+                                        ),
+                                    }
+                                )
+                                state_manager.log_action(
+                                    action_type='policy_recommendations_emitted',
+                                    details={'tool_name': tool_name, 'recommendations': policy_recommendations},
+                                    success=True,
+                                )
                         except PolicyViolation as e:
                             # Policy violation - don't execute the tool
                             print(f"❌ POLICY VIOLATION: {e}")
@@ -576,6 +684,29 @@ async def run_agent(goal: str, mcp_servers: list = None):
                             # Log action to state manager
                             if result_obj.get("success"):
                                 actions_taken.append(f"{tool_name}({json.dumps(args)})")
+
+                                # Track cost-optimization recommendation/action KPIs when tool returns savings metadata.
+                                estimated_hourly_savings = float(result_obj.get('estimated_hourly_savings', 0.0) or 0.0)
+                                estimated_monthly_savings = float(result_obj.get('estimated_monthly_savings', 0.0) or 0.0)
+                                if tool_name in {
+                                    'aws_analyze_ec2_cost_optimization',
+                                    'aws_analyze_ec2_fleet_cost_optimization',
+                                    'aws_get_compute_optimizer_recommendations',
+                                    'aws_detect_idle_cost_leaks',
+                                }:
+                                    state_manager.log_cost_recommendation(
+                                        recommendation_type=tool_name,
+                                        details={'args': args, 'result_summary': result_obj},
+                                        estimated_hourly_savings_usd=estimated_hourly_savings,
+                                        estimated_monthly_savings_usd=estimated_monthly_savings,
+                                    )
+                                if tool_name in {'aws_resize_ec2_instance', 'aws_apply_ec2_rightsizing'}:
+                                    state_manager.log_cost_action_applied(
+                                        action_type=tool_name,
+                                        details={'args': args, 'result_summary': result_obj},
+                                        estimated_hourly_savings_usd=estimated_hourly_savings,
+                                        estimated_monthly_savings_usd=estimated_monthly_savings,
+                                    )
                                 
                                 # Log specific resource operations
                                 if tool_name == "aws_create_ec2_instance" and "instance" in result_obj:

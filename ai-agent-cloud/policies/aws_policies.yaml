@@ -175,3 +175,17 @@ general:
 
   # Cleanup
   auto_tag_creation_date: true # Add creation timestamp for cleanup
+
+# Cost Optimization Policies
+cost_optimization:
+  # Modes:
+  # - recommend: emit guidance but do not block actions
+  # - enforce: block violating actions via PolicyViolation
+  policy_mode: recommend
+
+  # Resize safety controls
+  require_backup_before_resize: true
+  max_resize_target_hourly_cost: 0.20
+
+  # Operational hygiene for small/medium environments , helps prevent alarm fatigue and runaway costs.
+  limit_stale_alarm_sprawl: true

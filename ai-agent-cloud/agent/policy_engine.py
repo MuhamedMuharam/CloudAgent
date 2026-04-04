@@ -13,6 +13,7 @@ import re
 import ipaddress
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
+from cloud_providers.aws.mapping import map_generic_to_instance_type, get_estimated_hourly_cost
 
 
 class PolicyViolation(Exception):
@@ -37,6 +38,7 @@ class PolicyEngine:
         """
         self.policy_file = Path(policy_file)
         self.policies = self._load_policies()
+        self.pending_recommendations: List[Dict[str, Any]] = []
         
         if self.policies:
             print(f"✅ Policy engine loaded with {len(self.policies)} policy sections")
@@ -114,6 +116,10 @@ class PolicyEngine:
             pass
         elif tool_name == "aws_create_nat_gateway":
             self._validate_nat_gateway_creation(arguments)
+        elif tool_name in {"aws_resize_ec2_instance", "aws_apply_ec2_rightsizing"}:
+            self._validate_ec2_resize(arguments)
+        elif tool_name == "aws_create_metric_alarm":
+            self._validate_alarm_creation(arguments)
         elif tool_name == "aws_ssm_run_command":
             self._validate_ssm_run_command(arguments)
         elif tool_name in {
@@ -125,6 +131,35 @@ class PolicyEngine:
         }:
             self._validate_ssm_service_operation(tool_name, arguments)
         # Add more validators as needed
+
+    def pop_policy_recommendations(self) -> List[Dict[str, Any]]:
+        """Return and clear pending non-blocking policy recommendations."""
+        buffered = list(self.pending_recommendations)
+        self.pending_recommendations.clear()
+        return buffered
+
+    def _policy_mode(self) -> str:
+        """Resolve policy mode for cost optimization checks."""
+        cost_cfg = self.policies.get('cost_optimization', {})
+        mode = str(cost_cfg.get('policy_mode', 'recommend')).strip().lower()
+        if mode not in {'recommend', 'enforce'}:
+            mode = 'recommend'
+        return mode
+
+    def _emit_cost_violation_or_recommendation(self, message: str, code: str):
+        """Block in enforce mode, otherwise keep execution and emit recommendation."""
+        mode = self._policy_mode()
+        if mode == 'enforce':
+            raise PolicyViolation(message)
+
+        recommendation = {
+            'domain': 'cost_optimization',
+            'code': code,
+            'message': message,
+            'mode': mode,
+        }
+        self.pending_recommendations.append(recommendation)
+        print(f"⚠️  COST POLICY RECOMMENDATION: {message}")
     
     def _validate_ec2_creation(self, args: Dict[str, Any]):
         """Validate EC2 instance creation."""
@@ -146,6 +181,34 @@ class PolicyEngine:
             raise PolicyViolation(
                 f"RAM {ram}GB exceeds maximum allowed {max_ram}GB. "
                 f"Policy prevents creating expensive instances."
+            )
+
+        # Required tags for governance and cost attribution.
+        required_tags = [str(tag).strip() for tag in ec2_policies.get('required_tags', []) if str(tag).strip()]
+        provided_tags = args.get('tags') if isinstance(args.get('tags'), dict) else {}
+        missing_tags = [tag for tag in required_tags if tag not in provided_tags and tag != 'ManagedBy']
+        if missing_tags:
+            self._emit_cost_violation_or_recommendation(
+                "Missing required tags for EC2 creation: " + ", ".join(missing_tags),
+                code='missing_required_tags',
+            )
+
+        # Real-time cost guardrail.
+        requested_instance_type = args.get('instance_type')
+        if requested_instance_type:
+            instance_type = str(requested_instance_type)
+        else:
+            instance_type = map_generic_to_instance_type(cpu=cpu, ram=ram)
+
+        estimated_hourly_cost = get_estimated_hourly_cost(instance_type)
+        max_hourly_cost = float(ec2_policies.get('max_hourly_cost', 9999.0))
+        if estimated_hourly_cost > max_hourly_cost:
+            self._emit_cost_violation_or_recommendation(
+                (
+                    f"Estimated hourly cost ${estimated_hourly_cost:.4f} for instance type '{instance_type}' "
+                    f"exceeds policy max_hourly_cost ${max_hourly_cost:.4f}."
+                ),
+                code='ec2_hourly_cost_limit',
             )
         
         print(f"✅ Policy validation passed for EC2 instance '{args.get('name', 'unnamed')}'")
@@ -509,10 +572,65 @@ class PolicyEngine:
     def _validate_nat_gateway_creation(self, args: Dict[str, Any]):
         """Validate NAT Gateway creation."""
         nat_policies = self.policies.get('nat_gateway', {})
-        
-        # NAT Gateways cost money - just warn for now
+
+        if nat_policies.get('require_justification', False):
+            justification = args.get('justification')
+            if not isinstance(justification, str) or not justification.strip():
+                self._emit_cost_violation_or_recommendation(
+                    "NAT gateway creation requires a non-empty justification.",
+                    code='nat_missing_justification',
+                )
+
         print(f"⚠️  NAT Gateway will incur costs (~$0.045/hour + data transfer)")
         print(f"✅ Policy validation passed for NAT Gateway '{args.get('name', 'unnamed')}'")
+
+    def _validate_ec2_resize(self, args: Dict[str, Any]):
+        """Validate EC2 resize operation safety and governance."""
+        cost_cfg = self.policies.get('cost_optimization', {})
+
+        create_backup = bool(args.get('create_backup', True))
+        if cost_cfg.get('require_backup_before_resize', True) and not create_backup:
+            self._emit_cost_violation_or_recommendation(
+                "Resize requires AMI backup before instance type change.",
+                code='resize_requires_backup',
+            )
+
+        target_type = args.get('target_instance_type')
+        if not target_type:
+            # Attribute-based selection path is allowed when target is omitted.
+            return
+
+        target_hourly = get_estimated_hourly_cost(str(target_type))
+        max_resize_hourly = float(cost_cfg.get('max_resize_target_hourly_cost', 9999.0))
+        if target_hourly > max_resize_hourly:
+            self._emit_cost_violation_or_recommendation(
+                (
+                    f"Requested resize target '{target_type}' estimated at ${target_hourly:.4f}/hr "
+                    f"exceeds max_resize_target_hourly_cost ${max_resize_hourly:.4f}/hr"
+                ),
+                code='resize_target_too_expensive',
+            )
+
+    def _validate_alarm_creation(self, args: Dict[str, Any]):
+        """Flag potentially stale/high-noise alarm setup for small environments."""
+        cost_cfg = self.policies.get('cost_optimization', {})
+        if not cost_cfg.get('limit_stale_alarm_sprawl', True):
+            return
+
+        evaluation_periods = int(args.get('evaluation_periods', 1))
+        period = int(args.get('period', 60))
+        if evaluation_periods * period < 300:
+            self.pending_recommendations.append(
+                {
+                    'domain': 'cost_optimization',
+                    'code': 'alarm_too_short_window',
+                    'message': (
+                        "Alarm evaluation window is very short (<5 min). "
+                        "This may increase noisy/stale alarms and operational cost."
+                    ),
+                    'mode': 'recommend',
+                }
+            )
     
     def estimate_cost(self, tool_name: str, arguments: Dict[str, Any]) -> float:
         """

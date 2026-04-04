@@ -164,7 +164,11 @@ class StateManager:
                 # Metrics for thesis evaluation
                 "total_goals_executed": 0,  # How many goals agent completed
                 "total_resources_created": 0,  # Total resources created
-                "total_resources_deleted": 0  # Total resources destroyed
+                "total_resources_deleted": 0,  # Total resources destroyed
+                "cost_recommendations_generated": 0,
+                "cost_actions_applied": 0,
+                "estimated_hourly_savings_usd": 0.0,
+                "estimated_monthly_savings_usd": 0.0,
             }
         }
         self._save_state(initial_state)
@@ -470,6 +474,58 @@ class StateManager:
         """Get agent statistics."""
         state = self._load_state()
         return state.get("statistics", {})
+
+    def log_cost_recommendation(
+        self,
+        recommendation_type: str,
+        details: Dict[str, Any],
+        estimated_hourly_savings_usd: float = 0.0,
+        estimated_monthly_savings_usd: float = 0.0,
+    ):
+        """Track generated cost recommendation KPIs and audit event."""
+        state = self._load_state()
+        stats = state.setdefault('statistics', {})
+        stats['cost_recommendations_generated'] = int(stats.get('cost_recommendations_generated', 0)) + 1
+        stats['estimated_hourly_savings_usd'] = float(stats.get('estimated_hourly_savings_usd', 0.0)) + float(estimated_hourly_savings_usd)
+        stats['estimated_monthly_savings_usd'] = float(stats.get('estimated_monthly_savings_usd', 0.0)) + float(estimated_monthly_savings_usd)
+        self._save_state(state)
+
+        self.log_action(
+            action_type='cost_recommendation_generated',
+            details={
+                'recommendation_type': recommendation_type,
+                'estimated_hourly_savings_usd': estimated_hourly_savings_usd,
+                'estimated_monthly_savings_usd': estimated_monthly_savings_usd,
+                **details,
+            },
+            success=True,
+        )
+
+    def log_cost_action_applied(
+        self,
+        action_type: str,
+        details: Dict[str, Any],
+        estimated_hourly_savings_usd: float = 0.0,
+        estimated_monthly_savings_usd: float = 0.0,
+    ):
+        """Track applied cost action KPIs and audit event."""
+        state = self._load_state()
+        stats = state.setdefault('statistics', {})
+        stats['cost_actions_applied'] = int(stats.get('cost_actions_applied', 0)) + 1
+        stats['estimated_hourly_savings_usd'] = float(stats.get('estimated_hourly_savings_usd', 0.0)) + float(estimated_hourly_savings_usd)
+        stats['estimated_monthly_savings_usd'] = float(stats.get('estimated_monthly_savings_usd', 0.0)) + float(estimated_monthly_savings_usd)
+        self._save_state(state)
+
+        self.log_action(
+            action_type='cost_action_applied',
+            details={
+                'applied_action_type': action_type,
+                'estimated_hourly_savings_usd': estimated_hourly_savings_usd,
+                'estimated_monthly_savings_usd': estimated_monthly_savings_usd,
+                **details,
+            },
+            success=True,
+        )
     
     def get_audit_log(self, limit: int = None, action_type: str = None) -> List[Dict]:
         """
@@ -524,6 +580,10 @@ class StateManager:
             f"  - Total Goals Executed: {stats.get('total_goals_executed', 0)}",
             f"  - Total Resources Created: {stats.get('total_resources_created', 0)}",
             f"  - Total Resources Deleted: {stats.get('total_resources_deleted', 0)}",
+            f"  - Cost Recommendations Generated: {stats.get('cost_recommendations_generated', 0)}",
+            f"  - Cost Actions Applied: {stats.get('cost_actions_applied', 0)}",
+            f"  - Estimated Hourly Savings (USD): {stats.get('estimated_hourly_savings_usd', 0.0):.4f}",
+            f"  - Estimated Monthly Savings (USD): {stats.get('estimated_monthly_savings_usd', 0.0):.2f}",
             "",
             "🌐 AWS Infrastructure (Hierarchical View):",
         ]
