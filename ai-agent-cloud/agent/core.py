@@ -39,6 +39,7 @@ BASE_SYSTEM_PROMPT = (
     "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
     "- For host-level operations on EC2 instances, prefer SSM tools over ad-hoc shell approaches\n"
     "- Report exactly what you changed/found\n"
+     "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
 )
 
 

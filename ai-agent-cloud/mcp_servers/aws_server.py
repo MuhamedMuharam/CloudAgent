@@ -508,6 +508,9 @@ async def aws_resize_ec2_instance(
     dry_run: bool = True,
     no_reboot_backup: bool = True,
     prefer_downsize_when_idle: bool = True,
+    ensure_service_continuity: bool = True,
+    strict_service_continuity: bool = False,
+    service_recovery_timeout_seconds: int = 300,
 ) -> dict:
     """
     Resize an EC2 instance safely with compatibility checks and optional AMI backup.
@@ -547,6 +550,8 @@ async def aws_resize_ec2_instance(
                 "selection": selection,
                 "compatibility": compatibility,
                 "backup_will_be_created": create_backup,
+                "service_continuity_enabled": ensure_service_continuity,
+                "strict_service_continuity": strict_service_continuity,
                 "message": "Dry-run only. No infrastructure changes were applied.",
             }
             if selection:
@@ -560,6 +565,9 @@ async def aws_resize_ec2_instance(
             create_backup=create_backup,
             backup_name_prefix=backup_name_prefix,
             no_reboot_backup=no_reboot_backup,
+            ensure_previously_running_services=ensure_service_continuity,
+            strict_service_recovery=strict_service_continuity,
+            service_recovery_timeout_seconds=service_recovery_timeout_seconds,
         )
 
         return {
@@ -588,6 +596,9 @@ async def aws_apply_ec2_rightsizing(
     prefer_downsize_when_idle: bool = True,
     minutes: int = 180,
     period_seconds: int = 300,
+    ensure_service_continuity: bool = True,
+    strict_service_continuity: bool = False,
+    service_recovery_timeout_seconds: int = 300,
 ) -> dict:
     """
     Smart apply wrapper:
@@ -666,6 +677,9 @@ async def aws_apply_ec2_rightsizing(
             create_backup=create_backup,
             backup_name_prefix=backup_name_prefix,
             no_reboot_backup=no_reboot_backup,
+            ensure_previously_running_services=ensure_service_continuity,
+            strict_service_recovery=strict_service_continuity,
+            service_recovery_timeout_seconds=service_recovery_timeout_seconds,
         )
 
         return {

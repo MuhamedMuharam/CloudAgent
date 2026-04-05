@@ -4,10 +4,13 @@ Handles all EC2 instance operations using boto3.
 """
 
 import sys
+import time
+import shlex
 import boto3
 from botocore.exceptions import ClientError
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
+from .ssm import SSMManager
 from .mapping import (
     map_generic_to_instance_type,
     get_estimated_hourly_cost,
@@ -32,6 +35,7 @@ class EC2Manager:
         self.ec2_client = boto3.client('ec2', region_name=region)
         self.ec2_resource = boto3.resource('ec2', region_name=region)
         self.ssm_client = boto3.client('ssm', region_name=region)
+        self.ssm_manager = SSMManager(region=region)
         self.compute_optimizer_client = boto3.client('compute-optimizer', region_name=region)
     
     def list_instances(self, tag_filter: Optional[Dict[str, str]] = None) -> List[Dict]:
@@ -456,6 +460,233 @@ class EC2Manager:
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
 
+    def wait_for_ssm_online(
+        self,
+        instance_id: str,
+        timeout_seconds: int = 300,
+        poll_interval_seconds: int = 10,
+    ) -> Dict:
+        """
+        Wait until an instance is visible and online in SSM.
+        """
+        deadline = time.time() + max(timeout_seconds, 1)
+        poll_interval_seconds = max(poll_interval_seconds, 1)
+        last_status = None
+
+        while time.time() < deadline:
+            try:
+                status = self.get_instance_ssm_status(instance_id)
+                last_status = status
+                if status.get('managed_by_ssm') and str(status.get('ping_status', '')).lower() == 'online':
+                    return {
+                        'instance_id': instance_id,
+                        'online': True,
+                        'status': status,
+                    }
+            except Exception as e:
+                last_status = {'error': str(e)}
+
+            time.sleep(poll_interval_seconds)
+
+        return {
+            'instance_id': instance_id,
+            'online': False,
+            'status': last_status,
+            'message': 'Timed out waiting for SSM online status.',
+        }
+
+    @staticmethod
+    def _extract_first_invocation_stdout(command_result: Dict) -> str:
+        invocations = command_result.get('invocations', []) if isinstance(command_result, dict) else []
+        if invocations and isinstance(invocations[0], dict):
+            return str(invocations[0].get('stdout', '') or '')
+        return ''
+
+    @staticmethod
+    def _parse_running_service_units(command_stdout: str) -> List[str]:
+        """
+        Parse service unit names from `systemctl list-units` output.
+        """
+        services: List[str] = []
+        seen = set()
+
+        for raw_line in str(command_stdout or '').splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('UNIT ') or line.startswith('LOAD '):
+                continue
+            if ' loaded units listed.' in line:
+                continue
+
+            unit = line.split()[0]
+            if unit.endswith('.service') and unit not in seen:
+                seen.add(unit)
+                services.append(unit)
+
+        return services
+
+    def capture_running_services_snapshot(
+        self,
+        instance_id: str,
+        completion_timeout_seconds: int = 120,
+    ) -> Dict:
+        """
+        Capture running systemd services via SSM before disruptive operations.
+        """
+        ssm_wait = self.wait_for_ssm_online(
+            instance_id=instance_id,
+            timeout_seconds=max(30, completion_timeout_seconds),
+            poll_interval_seconds=5,
+        )
+        if not ssm_wait.get('online'):
+            return {
+                'captured': False,
+                'instance_id': instance_id,
+                'reason': 'ssm_not_online_before_resize',
+                'ssm_wait': ssm_wait,
+                'running_services': [],
+            }
+
+        command_result = self.ssm_manager.list_running_services(
+            instance_id=instance_id,
+            wait_for_completion=True,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=2,
+        )
+        command_status = command_result.get('status')
+        command_stdout = self._extract_first_invocation_stdout(command_result)
+        running_services = self._parse_running_service_units(command_stdout)
+
+        return {
+            'captured': command_status == 'Success',
+            'instance_id': instance_id,
+            'command_status': command_status,
+            'running_services_count': len(running_services),
+            'running_services': running_services,
+            'raw_command_result': command_result,
+        }
+
+    @staticmethod
+    def _extract_unrecovered_services(command_stdout: str) -> List[str]:
+        marker_start = 'UNRECOVERED_SERVICES_BEGIN'
+        marker_end = 'UNRECOVERED_SERVICES_END'
+        lines = str(command_stdout or '').splitlines()
+
+        in_section = False
+        unrecovered: List[str] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line == marker_start:
+                in_section = True
+                continue
+            if line == marker_end:
+                break
+            if in_section and line.endswith('.service'):
+                unrecovered.append(line)
+
+        # De-duplicate while preserving order.
+        seen = set()
+        result = []
+        for service_name in unrecovered:
+            if service_name not in seen:
+                seen.add(service_name)
+                result.append(service_name)
+        return result
+
+    def ensure_services_running_after_resize(
+        self,
+        instance_id: str,
+        services: List[str],
+        completion_timeout_seconds: int = 180,
+    ) -> Dict:
+        """
+        Ensure service continuity after resize:
+        - verify that previously running services are active
+        - attempt to start inactive ones
+        - report unrecovered services
+        """
+        normalized_services = [svc.strip() for svc in services if str(svc).strip().endswith('.service')]
+        if not normalized_services:
+            return {
+                'success': True,
+                'instance_id': instance_id,
+                'attempted_services_count': 0,
+                'unrecovered_services': [],
+                'recovered_services_count': 0,
+                'message': 'No pre-resize running services were captured.',
+            }
+
+        quoted_services = ' '.join(shlex.quote(svc) for svc in normalized_services)
+        continuity_commands = [
+            'UNRECOVERED_FILE="/tmp/ai-agent-unrecovered-services.txt"',
+            ': > "$UNRECOVERED_FILE"',
+            f'for svc in {quoted_services}; do',
+            '  if ! systemctl is-active --quiet "$svc"; then',
+            '    sudo systemctl start "$svc" >/dev/null 2>&1 || true',
+            '    sleep 1',
+            '  fi',
+            '  if ! systemctl is-active --quiet "$svc"; then',
+            '    echo "$svc" >> "$UNRECOVERED_FILE"',
+            '  fi',
+            'done',
+            'echo "UNRECOVERED_SERVICES_BEGIN"',
+            'cat "$UNRECOVERED_FILE"',
+            'echo "UNRECOVERED_SERVICES_END"',
+        ]
+
+        command_result = self.ssm_manager.run_command(
+            instance_ids=[instance_id],
+            commands=continuity_commands,
+            comment='Ensure pre-resize services are running after resize',
+            wait_for_completion=True,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=2,
+        )
+        command_status = command_result.get('status')
+        command_stdout = self._extract_first_invocation_stdout(command_result)
+        unrecovered_services = self._extract_unrecovered_services(command_stdout)
+
+        diagnostics_result = None
+        if unrecovered_services:
+            diagnostic_commands = []
+            for service_name in unrecovered_services:
+                quoted_service = shlex.quote(service_name)
+                diagnostic_commands.extend(
+                    [
+                        f'echo "SERVICE_DIAG_BEGIN:{service_name}"',
+                        (
+                            f'systemctl show {quoted_service} '
+                            '-p Id -p LoadState -p ActiveState -p SubState '
+                            '-p UnitFileState -p Result -p ExecMainStatus '
+                            '-p FragmentPath || true'
+                        ),
+                        f'echo "SERVICE_DIAG_STATUS:{service_name}"',
+                        f'systemctl status {quoted_service} --no-pager -l || true',
+                        f'echo "SERVICE_DIAG_END:{service_name}"',
+                    ]
+                )
+
+            diagnostics_result = self.ssm_manager.run_command(
+                instance_ids=[instance_id],
+                commands=diagnostic_commands,
+                comment='Collect diagnostics for unrecovered services after resize',
+                wait_for_completion=True,
+                completion_timeout_seconds=max(60, completion_timeout_seconds),
+                poll_interval_seconds=2,
+            )
+
+        return {
+            'success': command_status == 'Success' and not unrecovered_services,
+            'instance_id': instance_id,
+            'command_status': command_status,
+            'attempted_services_count': len(normalized_services),
+            'unrecovered_services': unrecovered_services,
+            'recovered_services_count': len(normalized_services) - len(unrecovered_services),
+            'raw_command_result': command_result,
+            'unrecovered_service_diagnostics': diagnostics_result,
+        }
+
     def get_cheapest_compatible_instance_type(
         self,
         instance_id: str,
@@ -589,6 +820,9 @@ class EC2Manager:
         stop_timeout_seconds: int = 600,
         start_timeout_seconds: int = 600,
         no_reboot_backup: bool = True,
+        ensure_previously_running_services: bool = True,
+        strict_service_recovery: bool = False,
+        service_recovery_timeout_seconds: int = 300,
     ) -> Dict:
         """
         Safely resize an EC2 instance type with optional AMI backup and compatibility checks.
@@ -620,6 +854,24 @@ class EC2Manager:
                 no_reboot=no_reboot_backup,
             )
 
+        service_snapshot = None
+        if ensure_previously_running_services and source_state != 'stopped':
+            try:
+                service_snapshot = self.capture_running_services_snapshot(
+                    instance_id=instance_id,
+                    completion_timeout_seconds=max(60, service_recovery_timeout_seconds),
+                )
+            except Exception as e:
+                service_snapshot = {
+                    'captured': False,
+                    'instance_id': instance_id,
+                    'reason': 'snapshot_failed',
+                    'error': str(e),
+                    'running_services': [],
+                }
+
+        service_recovery = None
+
         try:
             if source_state != 'stopped':
                 self.stop_instance(instance_id)
@@ -634,6 +886,50 @@ class EC2Manager:
             self.start_instance(instance_id)
             if wait_for_start:
                 self.wait_for_instance_state(instance_id, 'running', timeout_seconds=start_timeout_seconds)
+
+            if ensure_previously_running_services:
+                pre_services = []
+                if isinstance(service_snapshot, dict):
+                    pre_services = service_snapshot.get('running_services', []) or []
+
+                if pre_services:
+                    ssm_wait = self.wait_for_ssm_online(
+                        instance_id=instance_id,
+                        timeout_seconds=max(60, service_recovery_timeout_seconds),
+                        poll_interval_seconds=5,
+                    )
+                    if ssm_wait.get('online'):
+                        service_recovery = self.ensure_services_running_after_resize(
+                            instance_id=instance_id,
+                            services=pre_services,
+                            completion_timeout_seconds=max(60, service_recovery_timeout_seconds),
+                        )
+                        service_recovery['ssm_wait'] = ssm_wait
+                    else:
+                        service_recovery = {
+                            'success': False,
+                            'instance_id': instance_id,
+                            'attempted_services_count': len(pre_services),
+                            'unrecovered_services': pre_services,
+                            'recovered_services_count': 0,
+                            'reason': 'ssm_not_online_after_resize',
+                            'ssm_wait': ssm_wait,
+                        }
+                else:
+                    service_recovery = {
+                        'success': True,
+                        'instance_id': instance_id,
+                        'attempted_services_count': 0,
+                        'unrecovered_services': [],
+                        'recovered_services_count': 0,
+                        'message': 'No captured pre-resize running services to enforce.',
+                    }
+
+                if strict_service_recovery and service_recovery and service_recovery.get('unrecovered_services'):
+                    unrecovered = ', '.join(service_recovery.get('unrecovered_services', []))
+                    raise Exception(
+                        f"Service continuity check failed after resize. Unrecovered services: {unrecovered}"
+                    )
 
             refreshed = self.get_instance_status(instance_id)
             source_hourly = get_estimated_hourly_cost(source_type)
@@ -650,6 +946,12 @@ class EC2Manager:
                 'estimated_hourly_cost_after': target_hourly,
                 'estimated_hourly_savings': max(0.0, source_hourly - target_hourly),
                 'estimated_monthly_savings': max(0.0, (source_hourly - target_hourly) * 24 * 30),
+                'service_continuity': {
+                    'enabled': ensure_previously_running_services,
+                    'strict': strict_service_recovery,
+                    'snapshot': service_snapshot,
+                    'post_resize_recovery': service_recovery,
+                },
                 'changed': True,
                 'message': f"Resized {instance_id} from {source_type} to {target_instance_type}",
             }
