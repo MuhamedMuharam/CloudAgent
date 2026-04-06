@@ -365,6 +365,87 @@ class EC2Manager:
             print(f"[ERROR] {error_msg}", file=sys.stderr)
             raise Exception(error_msg)
 
+    def get_instance_health_checks(self, instance_id: str) -> Dict:
+        """
+        Get EC2 system and instance health check status.
+
+        Args:
+            instance_id: EC2 instance ID
+
+        Returns:
+            Dictionary with instance/system status checks and scheduled events
+        """
+        try:
+            response = self.ec2_client.describe_instance_status(
+                InstanceIds=[instance_id],
+                IncludeAllInstances=True,
+            )
+
+            statuses = response.get('InstanceStatuses', [])
+            if not statuses:
+                status = self.get_instance_status(instance_id)
+                return {
+                    'instance_id': instance_id,
+                    'state': status.get('state'),
+                    'system_status': 'unknown',
+                    'instance_status': 'unknown',
+                    'reachability': {
+                        'system': 'unknown',
+                        'instance': 'unknown',
+                    },
+                    'scheduled_events': [],
+                    'is_impaired': False,
+                    'note': 'No instance status records returned yet (instance may be initializing or recently started).',
+                }
+
+            item = statuses[0]
+            system_details = item.get('SystemStatus', {})
+            instance_details = item.get('InstanceStatus', {})
+
+            system_status = system_details.get('Status', 'unknown')
+            instance_status = instance_details.get('Status', 'unknown')
+
+            system_checks = {
+                detail.get('Name'): detail.get('Status')
+                for detail in system_details.get('Details', [])
+            }
+            instance_checks = {
+                detail.get('Name'): detail.get('Status')
+                for detail in instance_details.get('Details', [])
+            }
+
+            events = []
+            for event in item.get('Events', []):
+                events.append(
+                    {
+                        'code': event.get('Code'),
+                        'description': event.get('Description'),
+                        'not_before': str(event.get('NotBefore')) if event.get('NotBefore') else None,
+                        'not_after': str(event.get('NotAfter')) if event.get('NotAfter') else None,
+                    }
+                )
+
+            impaired = any(status_value == 'impaired' for status_value in [system_status, instance_status])
+
+            return {
+                'instance_id': instance_id,
+                'availability_zone': item.get('AvailabilityZone'),
+                'instance_state': item.get('InstanceState', {}).get('Name'),
+                'system_status': system_status,
+                'instance_status': instance_status,
+                'reachability': {
+                    'system': system_checks.get('reachability', 'unknown'),
+                    'instance': instance_checks.get('reachability', 'unknown'),
+                },
+                'scheduled_events': events,
+                'is_impaired': impaired,
+            }
+
+        except ClientError as e:
+            error_msg = f"Failed to get instance health checks: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
+
     def get_instance_type_compatibility(self, source_instance_type: str, target_instance_type: str) -> Dict:
         """
         Return compatibility checks for moving from one instance type to another.

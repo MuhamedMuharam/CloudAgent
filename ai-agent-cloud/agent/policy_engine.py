@@ -122,6 +122,10 @@ class PolicyEngine:
             self._validate_alarm_creation(arguments)
         elif tool_name == "aws_ssm_run_command":
             self._validate_ssm_run_command(arguments)
+        elif tool_name == "aws_ssm_collect_host_diagnostics":
+            self._validate_ssm_collect_host_diagnostics(arguments)
+        elif tool_name == "aws_ssm_safe_disk_cleanup":
+            self._validate_ssm_safe_disk_cleanup(arguments)
         elif tool_name in {
             "aws_ssm_start_service",
             "aws_ssm_stop_service",
@@ -394,6 +398,49 @@ class PolicyEngine:
         print(
             f"✅ Policy validation passed for SSM command execution "
             f"({len(commands)} command(s), target_os={target_os})"
+        )
+
+    def _validate_ssm_collect_host_diagnostics(self, args: Dict[str, Any]):
+        """Validate generic host diagnostics collection tool arguments."""
+        ssm_policies = self.policies.get('ssm', {})
+        if not ssm_policies.get('enabled', True):
+            raise PolicyViolation("SSM diagnostics execution is disabled by policy")
+
+        target_os = self._resolve_target_os(args, ssm_policies)
+        self._validate_target_os(target_os, ssm_policies)
+
+        max_timeout = int(ssm_policies.get('max_timeout_seconds', 900))
+        completion_timeout_seconds = int(args.get('completion_timeout_seconds', 120))
+        if completion_timeout_seconds > max_timeout:
+            raise PolicyViolation(
+                f"Diagnostics timeout {completion_timeout_seconds}s exceeds policy maximum of {max_timeout}s"
+            )
+
+        print(f"✅ Policy validation passed for SSM host diagnostics (target_os={target_os})")
+
+    def _validate_ssm_safe_disk_cleanup(self, args: Dict[str, Any]):
+        """Validate bounded disk cleanup tool arguments."""
+        ssm_policies = self.policies.get('ssm', {})
+        if not ssm_policies.get('enabled', True):
+            raise PolicyViolation("SSM cleanup execution is disabled by policy")
+
+        target_os = self._resolve_target_os(args, ssm_policies)
+        self._validate_target_os(target_os, ssm_policies)
+
+        max_timeout = int(ssm_policies.get('max_timeout_seconds', 900))
+        completion_timeout_seconds = int(args.get('completion_timeout_seconds', 180))
+        if completion_timeout_seconds > max_timeout:
+            raise PolicyViolation(
+                f"Disk cleanup timeout {completion_timeout_seconds}s exceeds policy maximum of {max_timeout}s"
+            )
+
+        journal_vacuum_days = int(args.get('journal_vacuum_days', 7))
+        if journal_vacuum_days < 1 or journal_vacuum_days > 30:
+            raise PolicyViolation("journal_vacuum_days must be between 1 and 30")
+
+        print(
+            "✅ Policy validation passed for SSM safe disk cleanup "
+            f"(target_os={target_os}, journal_vacuum_days={journal_vacuum_days})"
         )
 
     def _validate_ssm_service_operation(self, tool_name: str, args: Dict[str, Any]):

@@ -77,6 +77,8 @@ INSTRUCTION_PACKS = {
         "  * /ai-agent/system -> OS/systemd/network/runtime host-level issues\n"
         "  * /ai-agent/agent -> alarm_worker and agent orchestration/decision logs\n"
         "- For root-cause analysis, correlate timestamps across app + worker + otel logs before concluding\n"
+        "- For host-level triage, prefer aws_collect_ec2_health_snapshot and aws_ssm_collect_host_diagnostics before proposing mitigations\n"
+        "- For disk pressure scenarios, run aws_ssm_safe_disk_cleanup with dry_run=true first and only apply cleanup with explicit execution intent\n"
     ),
     "ssm_execution": (
         "SSM COMMAND EXECUTION:\n"
@@ -378,6 +380,15 @@ async def run_agent(goal: str, mcp_servers: list = None):
             }
         ]
     
+    actions_taken = []
+    execution_result = {
+        "success": False,
+        "goal": goal,
+        "outcome": "not_started",
+        "reason": "not_started",
+        "actions_taken": actions_taken,
+    }
+
     try:
         # ═══════════════════════════════════════════════════════════════
         # STEP 3: Connect to MCP Servers
@@ -426,7 +437,6 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 print(f"   - {uri_template}")
         
         # Track actions for this goal
-        actions_taken = []
         cost_goal = is_cost_optimization_goal(goal)
         explicit_execution_intent = has_explicit_execution_intent(goal)
         recommendation_only_cost_mode = cost_goal and not explicit_execution_intent
@@ -761,6 +771,15 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     outcome=msg.content if msg.content else "Completed",
                     actions_taken=actions_taken
                 )
+
+                execution_result = {
+                    "success": True,
+                    "goal": goal,
+                    "outcome": msg.content if msg.content else "Completed",
+                    "reason": "completed",
+                    "actions_taken": actions_taken,
+                    "iterations": iteration,
+                }
                 
                 # Show statistics
                 stats = state_manager.get_statistics()
@@ -773,10 +792,29 @@ async def run_agent(goal: str, mcp_servers: list = None):
         
         if iteration >= max_iterations:
             print("\n⚠️  Agent reached maximum iterations")
+            timeout_outcome = (
+                f"Agent reached maximum iterations ({max_iterations}) before producing a final response."
+            )
+            state_manager.log_goal_execution(
+                goal=goal,
+                outcome=timeout_outcome,
+                actions_taken=actions_taken + ["max_iterations_reached"],
+            )
+            execution_result = {
+                "success": False,
+                "goal": goal,
+                "outcome": timeout_outcome,
+                "reason": "max_iterations_reached",
+                "actions_taken": actions_taken,
+                "iterations": iteration,
+                "max_iterations": max_iterations,
+            }
     
     finally:
         # Clean up MCP connections
         await mcp_client.close()
+
+    return execution_result
 
 
 # Synchronous wrapper for convenience
@@ -788,7 +826,7 @@ def run_agent_sync(goal: str, mcp_servers: list = None):
         goal: The objective for the agent to accomplish
         mcp_servers: Optional list of MCP server configurations
     """
-    asyncio.run(run_agent(goal, mcp_servers))
+    return asyncio.run(run_agent(goal, mcp_servers))
 
 
 if __name__ == "__main__":

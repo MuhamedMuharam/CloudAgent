@@ -350,6 +350,234 @@ async def aws_get_ec2_instance_ssm_status(instance_id: str) -> dict:
 
 
 @mcp.tool()
+async def aws_collect_ec2_health_snapshot(
+    instance_id: str,
+    minutes: int = 15,
+    period_seconds: int = 60,
+    include_agent_metrics: bool = True,
+    include_alarms: bool = True,
+    alarm_state_value: str = "ALARM",
+) -> dict:
+    """
+    Build a compact EC2 operational health snapshot.
+
+    This combines instance status, EC2 host health checks, SSM managed status,
+    recent CloudWatch metrics, and related alarms by InstanceId dimension.
+
+    Args:
+        instance_id: EC2 instance ID
+        minutes: Lookback window in minutes for metrics
+        period_seconds: CloudWatch period for metrics
+        include_agent_metrics: Include CWAgent metrics
+        include_alarms: Include related CloudWatch alarms
+        alarm_state_value: Alarm state filter when include_alarms=True
+    """
+    try:
+        status = ec2_manager.get_instance_status(instance_id)
+        health_checks = ec2_manager.get_instance_health_checks(instance_id)
+        ssm_status = ec2_manager.get_instance_ssm_status(instance_id)
+
+        metrics = cloudwatch_manager.get_ec2_metrics(
+            instance_id=instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+            include_agent_metrics=include_agent_metrics,
+        )
+
+        related_alarms = []
+        if include_alarms:
+            alarms = cloudwatch_manager.list_alarms(
+                state_value=alarm_state_value,
+                alarm_name_prefix=None,
+                max_records=100,
+            )
+            for alarm in alarms:
+                dims = alarm.get("dimensions", [])
+                if any(d.get("name") == "InstanceId" and d.get("value") == instance_id for d in dims):
+                    related_alarms.append(alarm)
+
+        findings = []
+        if health_checks.get("is_impaired"):
+            findings.append("EC2 health checks report impaired status.")
+        if ssm_status.get("managed_by_ssm") and str(ssm_status.get("ping_status", "")).lower() != "online":
+            findings.append("SSM is configured but the managed instance ping status is not Online.")
+        if include_alarms and related_alarms:
+            findings.append(f"Found {len(related_alarms)} related alarm(s) in state {alarm_state_value}.")
+
+        return {
+            "success": True,
+            "instance_id": instance_id,
+            "minutes": minutes,
+            "period_seconds": period_seconds,
+            "instance_status": status,
+            "health_checks": health_checks,
+            "ssm_status": ssm_status,
+            "metrics": metrics,
+            "related_alarms": {
+                "state_value": alarm_state_value,
+                "count": len(related_alarms),
+                "alarms": related_alarms,
+            },
+            "findings": findings,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_ssm_collect_host_diagnostics(
+    instance_id: str,
+    target_os: str = None,
+    include_journal_errors: bool = True,
+    include_network_snapshot: bool = True,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 120,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Collect standard host diagnostics from an EC2 instance via SSM.
+
+    This tool is intentionally generic and useful across many incidents:
+    disk pressure, memory pressure, service instability, and networking issues.
+    """
+    try:
+        commands = [
+            "echo '=== TIME_UTC ==='",
+            "date -u",
+            "echo '=== UPTIME ==='",
+            "uptime",
+            "echo '=== DISK_USAGE ==='",
+            "df -h",
+            "echo '=== TOP_DISK_PATHS_ROOT_MAXDEPTH2 ==='",
+            "sudo du -x -h / --max-depth=2 2>/dev/null | sort -h | tail -n 30",
+            "echo '=== MEMORY ==='",
+            "free -m",
+            "echo '=== LOAD_AND_TOP ==='",
+            "top -b -n1 | head -n 25",
+            "echo '=== FAILED_SYSTEMD_UNITS ==='",
+            "systemctl --failed --no-pager || true",
+            "echo '=== AI_AGENT_SERVICE_STATUS ==='",
+            "sudo systemctl status ai-agent.service --no-pager -l || true",
+            "echo '=== KERNEL_LOG_TAIL ==='",
+            "sudo dmesg | tail -n 80 || true",
+        ]
+
+        if include_journal_errors:
+            commands.extend(
+                [
+                    "echo '=== JOURNAL_ERRORS_LAST_20_MIN ==='",
+                    "sudo journalctl -p err..alert --since '20 min ago' --no-pager | tail -n 120 || true",
+                ]
+            )
+
+        if include_network_snapshot:
+            commands.extend(
+                [
+                    "echo '=== NETWORK_SOCKETS ==='",
+                    "ss -tulpn | head -n 80 || true",
+                ]
+            )
+
+        result = ssm_manager.run_command(
+            instance_ids=[instance_id],
+            commands=commands,
+            comment="Collect host diagnostics snapshot",
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+        return {
+            "success": True,
+            "instance_id": instance_id,
+            "target_os": target_os,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+async def aws_ssm_safe_disk_cleanup(
+    instance_id: str,
+    target_os: str = None,
+    dry_run: bool = True,
+    journal_vacuum_days: int = 7,
+    clean_package_cache: bool = True,
+    clean_tmp: bool = True,
+    wait_for_completion: bool = True,
+    completion_timeout_seconds: int = 180,
+    poll_interval_seconds: int = 2,
+) -> dict:
+    """
+    Perform safe, bounded disk cleanup via SSM.
+
+    By default, this runs in dry-run mode and only reports potential reclaim areas.
+    """
+    try:
+        safe_days = max(1, min(int(journal_vacuum_days), 30))
+        commands = [
+            "echo '=== DISK_BEFORE ==='",
+            "df -h",
+            "echo '=== JOURNAL_DISK_USAGE ==='",
+            "sudo journalctl --disk-usage || true",
+            "echo '=== TOP_VAR_LOG_PATHS ==='",
+            "sudo du -x -h /var/log --max-depth=2 2>/dev/null | sort -h | tail -n 30 || true",
+            "echo '=== TMP_FILES_OLDER_THAN_3_DAYS_PREVIEW ==='",
+            "sudo find /tmp /var/tmp -xdev -type f -mtime +3 -print | head -n 200 || true",
+        ]
+
+        mode = "dry_run"
+        if not dry_run:
+            mode = "apply"
+            commands.append(f"sudo journalctl --vacuum-time={safe_days}d || true")
+            if clean_package_cache:
+                commands.append("sudo dnf clean all || true")
+            if clean_tmp:
+                commands.append("sudo find /tmp /var/tmp -xdev -type f -mtime +3 -delete || true")
+
+            commands.extend(
+                [
+                    "echo '=== DISK_AFTER ==='",
+                    "df -h",
+                    "echo '=== JOURNAL_DISK_USAGE_AFTER ==='",
+                    "sudo journalctl --disk-usage || true",
+                ]
+            )
+
+        result = ssm_manager.run_command(
+            instance_ids=[instance_id],
+            commands=commands,
+            comment=f"Safe disk cleanup ({mode})",
+            wait_for_completion=wait_for_completion,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+        return {
+            "success": True,
+            "instance_id": instance_id,
+            "target_os": target_os,
+            "mode": mode,
+            "journal_vacuum_days": safe_days,
+            "clean_package_cache": clean_package_cache,
+            "clean_tmp": clean_tmp,
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
 async def aws_analyze_ec2_cost_optimization(
     instance_id: str,
     minutes: int = 180,

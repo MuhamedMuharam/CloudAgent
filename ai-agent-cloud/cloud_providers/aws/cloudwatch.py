@@ -80,8 +80,6 @@ class CloudWatchManager:
                 metric_specs=self._EC2_METRIC_SPECS,
             )
 
-            namespaced_metrics = {namespace: primary_metrics}
-
             agent_metrics = {}
             if include_agent_metrics:
                 agent_metrics = self._fetch_metric_series(
@@ -94,7 +92,6 @@ class CloudWatchManager:
                     use_unit_filter=False,
                     allow_dimension_fallback=True,
                 )
-                namespaced_metrics[agent_namespace] = agent_metrics
 
             primary_summary = self._summarize_metric_availability(primary_metrics)
             agent_summary = self._summarize_metric_availability(agent_metrics) if include_agent_metrics else None
@@ -116,7 +113,6 @@ class CloudWatchManager:
                 "period_seconds": period_seconds,
                 "metrics": primary_metrics,
                 "agent_metrics": agent_metrics,
-                "namespaced_metrics": namespaced_metrics,
                 "availability_summary": {
                     "primary": primary_summary,
                     "agent": agent_summary,
