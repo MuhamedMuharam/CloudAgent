@@ -41,6 +41,7 @@ User: "Create 2 EC2 instances"
 ### Currently Implemented
 
 - ✅ **MCP-based architecture** - Decoupled agent and cloud providers
+- ✅ **Observability helper agent** - Dedicated sub-agent for logs/metrics/traces summarization before controller planning
 - ✅ **AWS EC2 management** - Create, list, delete, monitor instances
 - ✅ **Dynamic tool discovery** - Agent discovers capabilities from MCP servers
 - ✅ **Intelligent resource mapping** - Generic specs (2 CPU, 4GB RAM) → AWS instance types
@@ -185,7 +186,8 @@ This project investigates:
 
 | Component | Technology                   | Purpose              |
 | --------- | ---------------------------- | -------------------- |
-| AI Agent  | GPT-4o-mini (OpenAI)         | Planning & reasoning |
+| AI Agent  | GPT-5.4-mini (OpenAI)        | Planning & reasoning |
+| Helper Agent | GPT-4.1-mini (OpenAI)     | Observability summarization |
 | Protocol  | MCP (Model Context Protocol) | Tool communication   |
 | AWS SDK   | Boto3                        | EC2 management       |
 | Language  | Python 3.8+                  | Implementation       |

@@ -21,10 +21,38 @@ from openai import OpenAI  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
 from .state_manager import StateManager  # State tracking and audit logs
 from .policy_engine import PolicyEngine, PolicyViolation  # Policy validation
+from .observability_helper import (
+    OBSERVABILITY_HELPER_MODEL_DEFAULT,
+    run_observability_helper,
+)
 
 # Load environment variables from .env file
 # This loads: OPENAI_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
 load_dotenv()
+
+
+MAIN_CONTROLLER_MODEL_DEFAULT = "gpt-4.1-mini"
+
+OBSERVABILITY_HELPER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delegate_observability_analysis",
+        "description": (
+            "Delegate heavy logs/metrics/traces analysis to the observability helper agent. "
+            "Use this when telemetry payloads are large and require compact summarization."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "analysis_request": {
+                    "type": "string",
+                    "description": "Specific logs/metrics/traces analysis task for the helper agent",
+                }
+            },
+            "required": ["analysis_request"],
+        },
+    },
+}
 
 
 BASE_SYSTEM_PROMPT = (
@@ -38,6 +66,8 @@ BASE_SYSTEM_PROMPT = (
     "- If user asks for an MCP resource URI (aws://...), call read_mcp_resource instead of passing URI to AWS API tools\n"
     "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
     "- For host-level operations on EC2 instances, prefer SSM tools over ad-hoc shell approaches\n"
+    "- For logs/metrics/traces analysis, Call delegate_observability_analysis\n"
+    "- you may also use MCP observability tools directly\n"
     "- Report exactly what you changed/found\n"
      "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
 )
@@ -58,25 +88,15 @@ INSTRUCTION_PACKS = {
     ),
     "cloudwatch_alarms": (
         "CLOUDWATCH ALARM LOOKUP:\n"
-        "- For incident/alarm-response tasks, call aws_poll_alarm_notifications first\n"
+        "- For incident/alarm-response tasks, use alarm tools directly for alarm state/status checks\n"
+        "- If alarm context is missing and SQS integration is expected, call aws_poll_alarm_notifications\n"
         "- If the goal already contains explicit alarm context from an SQS worker, do not call aws_poll_alarm_notifications again unless context is missing\n"
         "- Prioritize newest notifications where alarm.new_state is ALARM\n"
         "- For alarms related to an EC2 instance, do not rely on alarm_name_prefix with instance Name\n"
         "- Prefer aws_list_ec2_alarms with instance_name or instance_id\n"
         "- If unavailable, resolve instance ID first, then filter aws_list_alarms by dimensions where name='InstanceId'\n"
         "- Do not conclude 'no alarms' without this dimension-based check\n"
-        "- For CloudWatch metric queries, choose period_seconds by lookback window to avoid oversampling:\n"
-        "  * up to 30 minutes -> 60 seconds\n"
-        "  * 31 to 180 minutes -> 300 seconds\n"
-        "  * more than 180 minutes -> 900 seconds or more\n"
-        "- If user asks for last hour metrics, explicitly call aws_get_ec2_metrics with period_seconds=300\n"
-        "- Log group routing for incident triage:\n"
-        "  * /ai-agent/app -> real-api request flow, input validation, order submission errors\n"
-        "  * /ai-agent/worker -> Celery task execution, retries/failures, processing latency\n"
-        "  * /ai-agent/otel -> OpenTelemetry collector pipeline/export issues to X-Ray\n"
-        "  * /ai-agent/system -> OS/systemd/network/runtime host-level issues\n"
-        "  * /ai-agent/agent -> alarm_worker and agent orchestration/decision logs\n"
-        "- For root-cause analysis, correlate timestamps across app + worker + otel logs before concluding\n"
+        "- For deep logs/metrics/traces analysis or summarization, consider delegate_observability_analysis\n"
         "- For host-level triage, prefer aws_collect_ec2_health_snapshot and aws_ssm_collect_host_diagnostics before proposing mitigations\n"
         "- For disk pressure scenarios, run aws_ssm_safe_disk_cleanup with dry_run=true first and only apply cleanup with explicit execution intent\n"
     ),
@@ -304,6 +324,22 @@ def has_explicit_execution_intent(goal: str) -> bool:
     )
 
 
+def is_observability_heavy_goal(goal: str) -> bool:
+    """Detect goals that likely need helper-first telemetry summarization."""
+    goal_lc = (goal or "").lower()
+
+    has_metrics = any(token in goal_lc for token in ["metric", "metrics", "cpu", "memory", "disk", "network"])
+    has_logs = any(token in goal_lc for token in ["log", "logs", "log group"])
+    has_traces = any(token in goal_lc for token in ["trace", "traces", "xray", "x-ray"])
+    asks_analysis = any(
+        token in goal_lc
+        for token in ["investigate", "root cause", "diagnose", "analysis", "mitigation", "summarize"]
+    )
+
+    observability_dimensions = sum([has_metrics, has_logs, has_traces])
+    return asks_analysis and observability_dimensions >= 2
+
+
 async def run_agent(goal: str, mcp_servers: list = None):
     """
     Run the AI agent with specified goal using MCP servers.
@@ -340,6 +376,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
     # Initialize OpenAI client for GPT-4 reasoning
     # GPT-4 will plan actions, decide which tools to call, and evaluate results
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    controller_model = os.getenv("MAIN_CONTROLLER_MODEL", MAIN_CONTROLLER_MODEL_DEFAULT)
     
     # Initialize MCP client manager
     # This will spawn MCP servers as subprocesses and communicate via stdio
@@ -416,6 +453,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         # Get tools in OpenAI function calling format
         # Converts MCP tool format to OpenAI's expected format
         tools = mcp_client.get_tools_for_openai()
+        tools.append(OBSERVABILITY_HELPER_TOOL)
         
         print(f"\n📋 Available tools (including MCP helpers): {len(tools)}")
         for tool in tools:
@@ -440,6 +478,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         cost_goal = is_cost_optimization_goal(goal)
         explicit_execution_intent = has_explicit_execution_intent(goal)
         recommendation_only_cost_mode = cost_goal and not explicit_execution_intent
+        helper_first_observability_mode = is_observability_heavy_goal(goal)
 
         # Initialize conversation
         goal_policy_domains = infer_policy_domains_from_goal(goal)
@@ -458,8 +497,21 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 "role": "system",
                 "content": build_capability_catalog(mcp_client)
             },
-            {"role": "user", "content": goal}
         ]
+
+        messages.append({"role": "user", "content": goal})
+
+        if helper_first_observability_mode:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "ROUTING HINT: This is an observability-heavy analysis goal. "
+                        "Call delegate_observability_analysis before issuing raw logs/metrics/traces tool calls. "
+                        "After helper summary is available, use direct MCP observability tools only for targeted verification."
+                    ),
+                }
+            )
 
         if recommendation_only_cost_mode:
             messages.append(
@@ -567,11 +619,13 @@ async def run_agent(goal: str, mcp_servers: list = None):
             )
         
         print(f"\n🎯 Agent Goal: {goal}\n")
+        print(f"🧠 Main controller model: {controller_model}")
         print("=" * 60)
         
         # Main agent loop
         iteration = 0
         max_iterations = 10  # Prevent infinite loops (reduced to avoid retries on transient errors)
+        helper_invoked_for_goal = False
         # actions_taken initialized before pre-router to include preloaded MCP reads
         
         while iteration < max_iterations:
@@ -579,7 +633,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
             
             # Call OpenAI with available tools
             response = client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=controller_model,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto"
@@ -600,6 +654,94 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     print(f"   Arguments: {json.dumps(args, indent=6)}")
                     
                     try:
+                        if tool_name == "delegate_observability_analysis":
+                            helper_model = os.getenv("OBSERVABILITY_HELPER_MODEL", OBSERVABILITY_HELPER_MODEL_DEFAULT)
+                            helper_request = args.get("analysis_request") or goal
+
+                            print(f"🛰️ Delegating to observability helper (model: {helper_model})")
+                            helper_result = await run_observability_helper(
+                                goal=goal,
+                                client=client,
+                                mcp_client=mcp_client,
+                                model=helper_model,
+                                analysis_request=helper_request,
+                            )
+
+                            helper_success = bool(helper_result.get("success"))
+                            helper_tools_used = helper_result.get("tools_used", [])
+                            helper_summary = helper_result.get("summary", "")
+                            helper_report = helper_result.get("report", {})
+
+                            tools_display = ", ".join(helper_tools_used) if helper_tools_used else "none"
+                            print(f"🛰️ Helper tools used: {tools_display}")
+                            print("🛰️ Helper response:")
+                            print(json.dumps(helper_report if helper_report else {"raw": helper_summary}, indent=2))
+
+                            state_manager.log_action(
+                                action_type="observability_helper_invoked",
+                                details={
+                                    "goal": goal,
+                                    "trigger_tool": "delegate_observability_analysis",
+                                    "analysis_request": helper_request,
+                                    "success": helper_success,
+                                    "model": helper_result.get("model"),
+                                    "reason": helper_result.get("reason"),
+                                    "iterations": helper_result.get("iterations"),
+                                    "tools_used": helper_tools_used,
+                                    "summary": helper_summary,
+                                    "report": helper_report,
+                                },
+                                success=helper_success,
+                                error=None if helper_success else str(helper_result.get("reason")),
+                            )
+
+                            actions_taken.append(
+                                "observability_helper(tool=delegate_observability_analysis,"
+                                f"model={helper_result.get('model')},success={helper_success})"
+                            )
+
+                            delegated_result = {
+                                "success": helper_success,
+                                "delegated_to": "observability_helper",
+                                "trigger_tool": "delegate_observability_analysis",
+                                "analysis_request": helper_request,
+                                "model": helper_result.get("model"),
+                                "reason": helper_result.get("reason"),
+                                "iterations": helper_result.get("iterations"),
+                                "helper_tools_used": helper_tools_used,
+                                "summary": helper_summary,
+                                "report": helper_report,
+                            }
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps(delegated_result),
+                            })
+                            helper_invoked_for_goal = True
+                            continue
+
+                        if helper_first_observability_mode and not helper_invoked_for_goal and tool_name in {
+                            "aws_get_ec2_metrics",
+                            "aws_list_log_groups",
+                            "aws_list_log_streams",
+                            "aws_get_log_events",
+                            "aws_filter_logs",
+                            "aws_get_xray_trace_summaries",
+                            "aws_get_xray_trace_details",
+                            "aws_get_xray_service_graph",
+                        }:
+                            guidance = (
+                                "For this observability-heavy goal, call delegate_observability_analysis first. "
+                                "Then use direct telemetry tools only for targeted follow-up verification."
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps({"success": False, "error": guidance}),
+                            })
+                            continue
+
                         if recommendation_only_cost_mode and tool_name in {
                             'aws_resize_ec2_instance',
                             'aws_apply_ec2_rightsizing',

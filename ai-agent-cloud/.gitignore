@@ -52,5 +52,8 @@ service-account-*.json
 .coverage
 htmlcov/
 
+# Thesis writing workspace
+thesis/
+
 
 

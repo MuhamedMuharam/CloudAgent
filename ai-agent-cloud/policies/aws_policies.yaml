@@ -185,7 +185,7 @@ cost_optimization:
 
   # Resize safety controls
   require_backup_before_resize: true
-  max_resize_target_hourly_cost: 0.20
+  max_resize_target_hourly_cost: 0.50
 
   # Operational hygiene for small/medium environments , helps prevent alarm fatigue and runaway costs.
   limit_stale_alarm_sprawl: true
