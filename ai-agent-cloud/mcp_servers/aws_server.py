@@ -451,8 +451,12 @@ async def aws_ssm_collect_host_diagnostics(
             "uptime",
             "echo '=== DISK_USAGE ==='",
             "df -h",
+            "echo '=== INODE_USAGE ==='",
+            "df -i",
             "echo '=== TOP_DISK_PATHS_ROOT_MAXDEPTH2 ==='",
             "sudo du -x -h / --max-depth=2 2>/dev/null | sort -h | tail -n 30",
+            "echo '=== TOP_LARGEST_FILES_COMMON_PATHS_BYTES ==='",
+            "sudo find /var /home /opt /tmp /root /usr/local -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n 40",
             "echo '=== MEMORY ==='",
             "free -m",
             "echo '=== LOAD_AND_TOP ==='",
@@ -2058,35 +2062,6 @@ async def aws_get_dashboard(dashboard_name: str = None) -> dict:
         }
 
 
-@mcp.resource("aws://observability/snapshot")
-def aws_observability_snapshot_resource() -> str:
-    """
-    Resource: region-level observability snapshot using configured defaults.
-
-    Uses CW_TEST_INSTANCE_ID and CW_TEST_LOG_GROUP when available.
-    """
-    snapshot = _build_observability_snapshot()
-    return json.dumps(snapshot, indent=2)
-
-
-@mcp.resource("aws://observability/ec2/{instance_id}/snapshot")
-def aws_observability_ec2_snapshot_resource(instance_id: str) -> str:
-    """
-    Resource: observability snapshot for a specific EC2 instance ID.
-    """
-    snapshot = _build_observability_snapshot(instance_id=instance_id)
-    return json.dumps(snapshot, indent=2)
-
-
-@mcp.resource("aws://observability/log-group/{log_group_name}/snapshot")
-def aws_observability_log_group_snapshot_resource(log_group_name: str) -> str:
-    """
-    Resource: observability snapshot focused on a specific CloudWatch log group.
-    """
-    snapshot = _build_observability_snapshot(log_group_name=log_group_name)
-    return json.dumps(snapshot, indent=2)
-
-
 @mcp.prompt()
 def aws_incident_triage_prompt(
     incident_summary: str,
@@ -2112,10 +2087,9 @@ def aws_incident_triage_prompt(
         "3) Pull recent logs and find first error signature and latest recurring pattern.\\n"
         "4) Correlate timeline across alarms, metrics spikes, and logs.\\n"
         "5) Propose immediate mitigations and rollback/safety checks.\\n\\n"
-        "Use these MCP resources/tools where applicable:\\n"
-        "- Resource: aws://observability/ec2/{instance_id}/snapshot\\n"
-        "- Resource: aws://observability/log-group/{log_group_name}/snapshot\\n"
+        "Use these MCP tools where applicable:\\n"
         "- Tool: aws_poll_alarm_notifications\n"
+        "- Tool: aws_collect_ec2_health_snapshot\\n"
         "- Tool: aws_get_ec2_metrics\\n"
         "- Tool: aws_list_ec2_alarms\\n"
         "- Tool: aws_filter_logs\\n"

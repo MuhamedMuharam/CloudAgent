@@ -13,7 +13,6 @@ This module orchestrates the entire agent workflow:
 import asyncio  # For async MCP communication
 import json
 import os
-import re
 import sys
 from typing import Dict, List, Set
 from dotenv import load_dotenv  # Load .env file with credentials
@@ -63,11 +62,11 @@ BASE_SYSTEM_PROMPT = (
     "- Prefer cost-efficient resources unless explicitly asked otherwise\n"
     "- For cost-optimization tasks, default to recommendation-only analysis unless the user explicitly asks to execute changes\n"
     "- Validate assumptions by calling tools before concluding\n"
-    "- If user asks for an MCP resource URI (aws://...), call read_mcp_resource instead of passing URI to AWS API tools\n"
     "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
     "- For host-level operations on EC2 instances, prefer SSM tools over ad-hoc shell approaches\n"
-    "- For logs/metrics/traces analysis, Call delegate_observability_analysis\n"
-    "- you may also use MCP observability tools directly\n"
+    "- For logs/metrics/traces analysis, use delegate_observability_analysis \n"
+    "- You may also use MCP observability tools directly for targeted checks\n"
+    "- When calling delegate_observability_analysis, craft analysis_request as a focused telemetry task for the current step; avoid copying the full user goal unless directly relevant\n"
     "- Report exactly what you changed/found\n"
      "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
 )
@@ -97,7 +96,12 @@ INSTRUCTION_PACKS = {
         "- If unavailable, resolve instance ID first, then filter aws_list_alarms by dimensions where name='InstanceId'\n"
         "- Do not conclude 'no alarms' without this dimension-based check\n"
         "- For deep logs/metrics/traces analysis or summarization, consider delegate_observability_analysis\n"
+        "- For CloudWatch metric queries, choose period_seconds by lookback window to avoid oversampling:\n"
+        "  * up to 30 minutes -> 60 seconds\n"
+        "  * 31 to 180 minutes -> 300 seconds\n"
+        "  * more than 180 minutes -> 900 seconds or more\n"
         "- For host-level triage, prefer aws_collect_ec2_health_snapshot and aws_ssm_collect_host_diagnostics before proposing mitigations\n"
+        "- For disk pressure incidents, final response must include actionable filesystem evidence: largest file/path candidates and inode usage (or explicitly state why unavailable)\n"
         "- For disk pressure scenarios, run aws_ssm_safe_disk_cleanup with dry_run=true first and only apply cleanup with explicit execution intent\n"
     ),
     "ssm_execution": (
@@ -252,35 +256,17 @@ def build_system_prompt(goal: str) -> str:
     return "\n\n".join(parts)
 
 
-def build_capability_catalog(mcp_client: MCPClientManager) -> str:
-    """Build a compact non-tool capability catalog for MCP resources/prompts."""
+def build_prompt_catalog(mcp_client: MCPClientManager) -> str:
+    """Build a compact non-tool capability catalog for MCP prompts only."""
     catalog = {
-        "resources": sorted(list(mcp_client.resources.keys())),
-        "resource_templates": sorted(list(mcp_client.resource_templates.keys())),
         "prompts": sorted(list(mcp_client.prompts.keys())),
     }
     return (
-        "MCP NON-TOOL CAPABILITY CATALOG (discoverable before planning):\n"
+        "MCP PROMPT CATALOG (discoverable before planning):\n"
         f"{json.dumps(catalog, indent=2)}\n\n"
         "Note: MCP tools are provided separately via the API tools field. "
-        "Use read_mcp_resource/get_mcp_prompt with the catalog above. "
-        "For resource templates, instantiate URIs using real values."
+        "Use get_mcp_prompt with the catalog above when relevant."
     )
-
-
-def extract_goal_resource_uris(goal: str) -> list:
-    """Extract explicit MCP-style resource URIs from goal text."""
-    if not goal:
-        return []
-
-    # Match scheme URIs such as aws://observability/snapshot
-    uri_matches = re.findall(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+", goal)
-    cleaned = []
-    for uri in uri_matches:
-        cleaned_uri = uri.rstrip(".,;)")
-        if cleaned_uri not in cleaned:
-            cleaned.append(cleaned_uri)
-    return cleaned
 
 
 def find_prompt_mentions(goal: str, prompt_names: list) -> list:
@@ -328,16 +314,11 @@ def is_observability_heavy_goal(goal: str) -> bool:
     """Detect goals that likely need helper-first telemetry summarization."""
     goal_lc = (goal or "").lower()
 
-    has_metrics = any(token in goal_lc for token in ["metric", "metrics", "cpu", "memory", "disk", "network"])
+    has_metrics = any(token in goal_lc for token in ["metric", "metrics", "metrices", "cpu", "memory", "disk", "network"])
     has_logs = any(token in goal_lc for token in ["log", "logs", "log group"])
     has_traces = any(token in goal_lc for token in ["trace", "traces", "xray", "x-ray"])
-    asks_analysis = any(
-        token in goal_lc
-        for token in ["investigate", "root cause", "diagnose", "analysis", "mitigation", "summarize"]
-    )
-
-    observability_dimensions = sum([has_metrics, has_logs, has_traces])
-    return asks_analysis and observability_dimensions >= 2
+    # Treat any explicit telemetry mention as observability-heavy for routing hints.
+    return has_metrics or has_logs or has_traces
 
 
 async def run_agent(goal: str, mcp_servers: list = None):
@@ -446,7 +427,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
         # STEP 4: Discover Capabilities from MCP Servers
         # ═══════════════════════════════════════════════════════════════
         
-        # Discover tools/resources/prompts from all connected servers.
+        # Discover tools/prompts from all connected servers.
         print("\n🔍 Discovering MCP capabilities from servers...")
         await mcp_client.discover_capabilities()
         
@@ -459,20 +440,10 @@ async def run_agent(goal: str, mcp_servers: list = None):
         for tool in tools:
             print(f"   - {tool['function']['name']}")
 
-        if mcp_client.resources:
-            print(f"\n📚 Available resources: {len(mcp_client.resources)}")
-            for uri in mcp_client.resources.keys():
-                print(f"   - {uri}")
-
         if mcp_client.prompts:
             print(f"\n🧠 Available prompts: {len(mcp_client.prompts)}")
             for prompt_name in mcp_client.prompts.keys():
                 print(f"   - {prompt_name}")
-
-        if mcp_client.resource_templates:
-            print(f"\n🧩 Available resource templates: {len(mcp_client.resource_templates)}")
-            for uri_template in mcp_client.resource_templates.keys():
-                print(f"   - {uri_template}")
         
         # Track actions for this goal
         cost_goal = is_cost_optimization_goal(goal)
@@ -495,7 +466,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
             },
             {
                 "role": "system",
-                "content": build_capability_catalog(mcp_client)
+                "content": build_prompt_catalog(mcp_client)
             },
         ]
 
@@ -546,30 +517,9 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 }
             )
 
-        # Deterministic pre-router: preload explicitly requested MCP resources/prompts
+        # Deterministic pre-router: preload explicitly requested MCP prompts
         # before the first model turn so the model starts with grounded context.
         preloaded_items = []
-
-        explicit_uris = extract_goal_resource_uris(goal)
-        for uri in explicit_uris:
-            try:
-                preloaded_result = await mcp_client.read_resource(uri)
-                preloaded_items.append(
-                    {
-                        "kind": "resource",
-                        "id": uri,
-                        "result": preloaded_result,
-                    }
-                )
-                actions_taken.append(f"read_mcp_resource({json.dumps({'uri': uri})})")
-            except Exception as e:
-                preloaded_items.append(
-                    {
-                        "kind": "resource",
-                        "id": uri,
-                        "error": str(e),
-                    }
-                )
 
         mentioned_prompts = find_prompt_mentions(goal, list(mcp_client.prompts.keys()))
         for prompt_name in mentioned_prompts:
@@ -656,7 +606,19 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     try:
                         if tool_name == "delegate_observability_analysis":
                             helper_model = os.getenv("OBSERVABILITY_HELPER_MODEL", OBSERVABILITY_HELPER_MODEL_DEFAULT)
-                            helper_request = args.get("analysis_request") or goal
+                            helper_request = (args.get("analysis_request") or "").strip()
+                            if not helper_request:
+                                guidance = (
+                                    "delegate_observability_analysis requires analysis_request. "
+                                    "Provide a focused telemetry task for this step "
+                                    "(scope/target/time window when relevant)."
+                                )
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": json.dumps({"success": False, "error": guidance}),
+                                })
+                                continue
 
                             print(f"🛰️ Delegating to observability helper (model: {helper_model})")
                             helper_result = await run_observability_helper(

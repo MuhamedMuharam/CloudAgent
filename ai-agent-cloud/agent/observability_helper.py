@@ -19,6 +19,8 @@ OBSERVABILITY_HELPER_MODEL_DEFAULT = "gpt-4o-mini"
 
 # Keep this list read-only/diagnostic focused.
 OBSERVABILITY_ALLOWED_TOOLS: Set[str] = {
+    "aws_collect_ec2_health_snapshot",
+    "aws_ssm_collect_host_diagnostics",
     "aws_list_ec2_instances",
     "aws_get_ec2_instance_status",
     "aws_get_ec2_instance_ssm_status",
@@ -143,7 +145,12 @@ async def run_observability_helper(
                 "You are the Observability Helper Agent for cloud incidents. "
                 "Your job is to run only diagnostic observability tools and produce a compact summary for a controller agent.\n\n"
                 "Rules:\n"
-                "- Focus on logs, metrics, and traces only.\n"
+                "- Scope MUST follow the controller request. If request is logs-only, do logs-only. If metrics-only, do metrics-only.\n"
+                "- Do not call tools outside requested scope unless needed to close a critical data gap.\n"
+                "- If scope includes host health/status checks, prefer aws_collect_ec2_health_snapshot first.\n"
+                "- For host/system and OS-level checks, use aws_ssm_collect_host_diagnostics when needed.\n"
+                "- For disk-pressure scope, collect host diagnostics and extract actionable filesystem evidence: top large files/paths and inode usage.\n"
+                "- Include concrete file/path names with sizes in evidence when available; if unavailable, explain why in data_gaps.\n"
                 "- Do not call mutating tools.\n"
                 "- Do not propose mitigation or remediation actions. Diagnostics only.\n"
                 "- If a user goal lacks identifiers, resolve instance IDs via list/status tools first.\n"

@@ -108,6 +108,42 @@ def _classify_alarm(alarm_name: str, payload: dict) -> str:
     return "generic_alarm"
 
 
+def _build_helper_analysis_request(
+    alarm_family: str,
+    instance_id: str,
+    fallback_instance_name: str,
+    metric_name: str,
+) -> str:
+    target = f"instance_id={instance_id}" if instance_id else f"instance_name={fallback_instance_name}"
+    metric_hint = metric_name or "unknown"
+    base = (
+        f"target={target}; "
+        "time_window=last 60 minutes; "
+        f"metric_hint={metric_hint}; "
+    )
+
+    if alarm_family in {"ec2_system_status", "ec2_instance_status"}:
+        scope = "scope=host health and status checks first, then metrics if needed"
+    elif alarm_family == "disk_pressure":
+        scope = (
+            "scope=disk metrics and system/application logs, plus host filesystem checks "
+            "to identify top large files/paths and inode pressure; traces only if logs indicate request-path errors"
+        )
+    elif alarm_family == "memory_pressure":
+        scope = "scope=memory metrics and app/worker logs; traces only if logs indicate latency/error propagation"
+    elif alarm_family == "cpu_pressure":
+        scope = "scope=cpu metrics first, then correlated app/worker logs; xray traces only for targeted confirmation"
+    else:
+        scope = "scope=balanced diagnostics across metrics, logs, traces"
+
+    return (
+        "Base analysis_request seed for delegate_observability_analysis: "
+        + base
+        + scope
+        + ". The agent may append additional context, hypotheses, and focused checks as needed."
+    )
+
+
 def _parse_bool_env(var_name: str, default: bool) -> bool:
     raw = os.getenv(var_name)
     if raw is None:
@@ -157,16 +193,26 @@ def _build_goal(
     dimensions_summary = ", ".join(f"{d['name']}={d['value']}" for d in dimensions[:10]) or "<none>"
     allowed_service_list = ", ".join(restart_services) if restart_services else "<none>"
     mitigation_mode = "execute-safe-mitigations" if auto_mitigate else "recommend-only"
+    helper_analysis_request_base = _build_helper_analysis_request(
+        alarm_family=alarm_family,
+        instance_id=instance_id,
+        fallback_instance_name=fallback_instance_name,
+        metric_name=metric_name,
+    )
 
     return (
         "An alarm notification was already received from SQS by the worker. "
         "Use this provided alarm context directly for triage and mitigation. "
         "Do not call aws_poll_alarm_notifications again unless required context is missing. "
+        "Before deciding mitigation, call delegate_observability_analysis once. "
+        f"Start helper analysis_request from this base seed and extend it as needed: {helper_analysis_request_base}. "
+        "Keep the base fields target, time_window, metric_hint, and scope, then add any extra context you need. "
+        "Use the helper structured JSON report as primary evidence. "
         f"Triage this ALARM for {target_phrase}. "
         f"Alarm context: name={alarm_name}, state={new_state}, family_hint={alarm_family}, metric_hint={metric_name or '<unknown>'}. "
         f"Dimensions: {dimensions_summary}. "
         f"Reason: {reason}. "
-        "Use generic mitigation tools where useful (not alarm-specific): "
+        "you can Use generic mitigation tools when needed (not alarm-specific): "
         "aws_collect_ec2_health_snapshot, aws_get_ec2_instance_status, aws_get_ec2_instance_ssm_status, "
         "aws_get_ec2_metrics, aws_list_ec2_alarms, aws_ssm_collect_host_diagnostics, aws_ssm_safe_disk_cleanup, "
         "aws_ssm_get_service_status, aws_ssm_restart_service, aws_reboot_ec2_instance. "
