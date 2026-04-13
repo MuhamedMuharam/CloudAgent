@@ -25,6 +25,7 @@ OBSERVABILITY_ALLOWED_TOOLS: Set[str] = {
     "aws_get_ec2_instance_status",
     "aws_get_ec2_instance_ssm_status",
     "aws_get_ec2_metrics",
+    "aws_get_ec2_metrics_scoped",
     "aws_list_log_groups",
     "aws_list_log_streams",
     "aws_get_log_events",

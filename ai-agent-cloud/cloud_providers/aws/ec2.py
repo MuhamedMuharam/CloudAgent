@@ -100,6 +100,10 @@ class EC2Manager:
         image_id: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
         instance_type: Optional[str] = None,
+        os_name: str = "amazon-linux-2023",
+        vpc_id: Optional[str] = None,
+        security_group_id: Optional[str] = None,
+        auto_assign_public_ip: bool = True,
     ) -> Dict:
         """
         Create a new EC2 instance.
@@ -108,7 +112,11 @@ class EC2Manager:
             name: Name for the instance (will be added as 'Name' tag)
             cpu: Number of virtual CPU cores (default: 2)
             ram: RAM in gigabytes (default: 4)
-            image_id: AMI ID to use. If None, uses latest Amazon Linux 2023
+            image_id: AMI ID to use. If provided, this overrides os_name
+            os_name: OS selector (default: amazon-linux-2023)
+            vpc_id: Target VPC ID or VPC Name tag. Defaults to account default VPC
+            security_group_id: Target SG ID or SG name. Defaults to default SG in selected VPC
+            auto_assign_public_ip: Auto-assign a public IPv4 for the primary ENI
         
         Returns:
             Dictionary with instance details (id, name, type, state)
@@ -124,9 +132,16 @@ class EC2Manager:
             # Map generic specs to instance type unless explicitly provided.
             resolved_instance_type = instance_type or map_generic_to_instance_type(cpu, ram)
             
-            # Get latest Amazon Linux 2023 AMI if not specified
-            if not image_id:
-                image_id = self._get_latest_amazon_linux_ami()
+            # Resolve AMI from explicit image_id or requested OS name.
+            resolved_image_id = image_id or self._resolve_image_id(os_name=os_name)
+
+            # Resolve network placement defaults (VPC, subnet, security group).
+            resolved_vpc_id = self._resolve_vpc_id(vpc_id=vpc_id)
+            resolved_subnet_id = self._resolve_subnet_id(vpc_id=resolved_vpc_id)
+            resolved_security_group_id = self._resolve_security_group_id(
+                vpc_id=resolved_vpc_id,
+                security_group_id=security_group_id,
+            )
             
             # Create instance
             user_tags = tags or {}
@@ -138,10 +153,18 @@ class EC2Manager:
             merged_tags.update(user_tags)
 
             instances = self.ec2_resource.create_instances(
-                ImageId=image_id,
+                ImageId=resolved_image_id,
                 InstanceType=resolved_instance_type,
                 MinCount=1,
                 MaxCount=1,
+                NetworkInterfaces=[
+                    {
+                        'DeviceIndex': 0,
+                        'SubnetId': resolved_subnet_id,
+                        'Groups': [resolved_security_group_id],
+                        'AssociatePublicIpAddress': bool(auto_assign_public_ip),
+                    }
+                ],
                 TagSpecifications=[
                     {
                         'ResourceType': 'instance',
@@ -161,6 +184,12 @@ class EC2Manager:
                 'state': 'pending',
                 'cpu': cpu,
                 'ram': ram,
+                'os_name': os_name,
+                'image_id': resolved_image_id,
+                'vpc_id': resolved_vpc_id,
+                'subnet_id': resolved_subnet_id,
+                'security_group_id': resolved_security_group_id,
+                'auto_assign_public_ip': bool(auto_assign_public_ip),
                 'estimated_hourly_cost': get_estimated_hourly_cost(resolved_instance_type),
             }
         
@@ -1113,3 +1142,136 @@ class EC2Manager:
         except ClientError as e:
             print(f"Warning: Error finding AMI, using fallback: {e}")
             return 'ami-0230bd60aa48260c6'
+
+    def _find_latest_ami(self, owners: List[str], name_pattern: str, fallback_ami: Optional[str] = None) -> str:
+        """Find latest AMI by owner+name pattern sorted by CreationDate."""
+        try:
+            response = self.ec2_client.describe_images(
+                Owners=owners,
+                Filters=[
+                    {'Name': 'name', 'Values': [name_pattern]},
+                    {'Name': 'state', 'Values': ['available']},
+                ],
+            )
+
+            images = response.get('Images', [])
+            if images:
+                latest = sorted(images, key=lambda x: x.get('CreationDate', ''), reverse=True)[0]
+                return latest['ImageId']
+        except ClientError as e:
+            print(f"Warning: Error finding AMI by pattern {name_pattern}: {e}")
+
+        if fallback_ami:
+            return fallback_ami
+        raise Exception(f"No AMI found for pattern: {name_pattern}")
+
+    def _resolve_image_id(self, os_name: str) -> str:
+        """Resolve an AMI ID from friendly OS name or explicit AMI id."""
+        value = (os_name or '').strip()
+        value_lc = value.lower()
+
+        if value_lc.startswith('ami-'):
+            return value
+
+        if value_lc in {'amazon-linux-2023', 'amazon linux 2023', 'al2023'}:
+            return self._get_latest_amazon_linux_ami()
+
+        if value_lc in {'amazon-linux-2', 'amazon linux 2', 'al2'}:
+            return self._find_latest_ami(
+                owners=['amazon'],
+                name_pattern='amzn2-ami-hvm-*-x86_64-gp2',
+            )
+
+        if value_lc in {'ubuntu-22.04', 'ubuntu 22.04', 'ubuntu-jammy'}:
+            return self._find_latest_ami(
+                owners=['099720109477'],
+                name_pattern='ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*',
+            )
+
+        if value_lc in {'ubuntu-24.04', 'ubuntu 24.04', 'ubuntu-noble'}:
+            return self._find_latest_ami(
+                owners=['099720109477'],
+                name_pattern='ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*',
+            )
+
+        raise Exception(
+            "Unsupported os_name. Use one of: amazon-linux-2023, amazon-linux-2, ubuntu-22.04, ubuntu-24.04, or an explicit ami-... id."
+        )
+
+    def _get_default_vpc_id(self) -> str:
+        response = self.ec2_client.describe_vpcs(
+            Filters=[{'Name': 'is-default', 'Values': ['true']}]
+        )
+        vpcs = response.get('Vpcs', [])
+        if not vpcs:
+            raise Exception('No default VPC found in this region.')
+        return vpcs[0]['VpcId']
+
+    def _resolve_vpc_id(self, vpc_id: Optional[str]) -> str:
+        value = (vpc_id or '').strip()
+        if not value or value.lower() in {'default', 'default-vpc', 'default_vpc'}:
+            return self._get_default_vpc_id()
+
+        if value.startswith('vpc-'):
+            return value
+
+        response = self.ec2_client.describe_vpcs(
+            Filters=[{'Name': 'tag:Name', 'Values': [value]}]
+        )
+        vpcs = response.get('Vpcs', [])
+        if not vpcs:
+            raise Exception(f"VPC not found by id/name: {value}")
+        return vpcs[0]['VpcId']
+
+    def _get_default_security_group_id(self, vpc_id: str) -> str:
+        response = self.ec2_client.describe_security_groups(
+            Filters=[
+                {'Name': 'vpc-id', 'Values': [vpc_id]},
+                {'Name': 'group-name', 'Values': ['default']},
+            ]
+        )
+        groups = response.get('SecurityGroups', [])
+        if not groups:
+            raise Exception(f"Default security group not found in VPC {vpc_id}")
+        return groups[0]['GroupId']
+
+    def _resolve_security_group_id(self, vpc_id: str, security_group_id: Optional[str]) -> str:
+        value = (security_group_id or '').strip()
+        if not value or value.lower() in {'default', 'default-sg', 'default_sg'}:
+            return self._get_default_security_group_id(vpc_id)
+
+        if value.startswith('sg-'):
+            return value
+
+        response = self.ec2_client.describe_security_groups(
+            Filters=[
+                {'Name': 'vpc-id', 'Values': [vpc_id]},
+                {'Name': 'group-name', 'Values': [value]},
+            ]
+        )
+        groups = response.get('SecurityGroups', [])
+        if not groups:
+            raise Exception(f"Security group not found by id/name: {value} in VPC {vpc_id}")
+        return groups[0]['GroupId']
+
+    def _resolve_subnet_id(self, vpc_id: str) -> str:
+        # Prefer default subnets for AZs; otherwise fall back to first available subnet.
+        response_default = self.ec2_client.describe_subnets(
+            Filters=[
+                {'Name': 'vpc-id', 'Values': [vpc_id]},
+                {'Name': 'default-for-az', 'Values': ['true']},
+            ]
+        )
+        default_subnets = response_default.get('Subnets', [])
+        if default_subnets:
+            default_subnets = sorted(default_subnets, key=lambda s: s.get('AvailabilityZone', ''))
+            return default_subnets[0]['SubnetId']
+
+        response_any = self.ec2_client.describe_subnets(
+            Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+        )
+        subnets = response_any.get('Subnets', [])
+        if not subnets:
+            raise Exception(f"No subnet found in VPC {vpc_id}")
+        subnets = sorted(subnets, key=lambda s: s.get('AvailabilityZone', ''))
+        return subnets[0]['SubnetId']

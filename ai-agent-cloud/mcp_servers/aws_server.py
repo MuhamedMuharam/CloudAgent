@@ -131,6 +131,159 @@ def _build_observability_snapshot(
     return snapshot
 
 
+def _metric_values_from_series(metrics_bucket: dict, metric_name: str) -> list:
+    metric_item = metrics_bucket.get(metric_name, {}) if isinstance(metrics_bucket, dict) else {}
+    datapoints = metric_item.get("datapoints", []) if isinstance(metric_item, dict) else []
+    values = []
+    for datapoint in datapoints:
+        value = datapoint.get("value")
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return values
+
+
+def _normalize_metric_scope(scope: str) -> str:
+    normalized = re.sub(r"[\s_]+", "-", (scope or "all").strip().lower())
+    if normalized.endswith("-only"):
+        normalized = normalized[:-5]
+
+    aliases = {
+        "mem": "memory",
+        "ram": "memory",
+        "net": "network",
+        "health": "status",
+        "checks": "status",
+        "filesystem": "disk",
+        "storage": "disk",
+        "io": "disk",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _canonical_metric_name(metric_name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (metric_name or "").strip().lower())
+
+
+def _average(values: list):
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _summarize_metric_bucket(metrics_bucket: dict) -> dict:
+    if not isinstance(metrics_bucket, dict):
+        return {
+            "total_metrics": 0,
+            "metrics_with_data": 0,
+            "metrics_without_data": [],
+            "total_datapoints": 0,
+        }
+
+    total_metrics = len(metrics_bucket)
+    metrics_with_data = 0
+    metrics_without_data = []
+    total_datapoints = 0
+
+    for metric_name, metric_payload in metrics_bucket.items():
+        datapoints = metric_payload.get("datapoints", []) if isinstance(metric_payload, dict) else []
+        datapoint_count = len(datapoints)
+        total_datapoints += datapoint_count
+        if datapoint_count > 0:
+            metrics_with_data += 1
+        else:
+            metrics_without_data.append(metric_name)
+
+    return {
+        "total_metrics": total_metrics,
+        "metrics_with_data": metrics_with_data,
+        "metrics_without_data": metrics_without_data,
+        "total_datapoints": total_datapoints,
+    }
+
+
+def _build_scoped_metrics_view(metrics_payload: dict, scope: str) -> dict:
+    scope_lc = _normalize_metric_scope(scope)
+
+    primary_metrics = metrics_payload.get("metrics", {}) if isinstance(metrics_payload, dict) else {}
+    agent_metrics = metrics_payload.get("agent_metrics", {}) if isinstance(metrics_payload, dict) else {}
+
+    scope_map = {
+        "cpu": ({"CPUUtilization"}, set()),
+        "network": ({"NetworkIn", "NetworkOut"}, set()),
+        "status": ({"StatusCheckFailed", "StatusCheckFailed_Instance", "StatusCheckFailed_System"}, set()),
+        "disk": (set(), {"disk_used_percent", "disk_inodes_free", "diskio_io_time"}),
+        "memory": (set(), {"mem_used_percent", "swap_used_percent"}),
+    }
+
+    if scope_lc in {"all", "full", "*"}:
+        selected_primary = primary_metrics
+        selected_agent = agent_metrics
+        normalized_scope = "all"
+    elif scope_lc in scope_map:
+        wanted_primary, wanted_agent = scope_map[scope_lc]
+        selected_primary = {k: v for k, v in primary_metrics.items() if k in wanted_primary}
+        selected_agent = {k: v for k, v in agent_metrics.items() if k in wanted_agent}
+        normalized_scope = scope_lc
+    else:
+        selected_primary = primary_metrics
+        selected_agent = agent_metrics
+        normalized_scope = "all"
+
+    return {
+        "scope": normalized_scope,
+        "metrics": selected_primary,
+        "agent_metrics": selected_agent,
+        "availability_summary": {
+            "primary": _summarize_metric_bucket(selected_primary),
+            "agent": _summarize_metric_bucket(selected_agent),
+        },
+    }
+
+
+def _build_metric_name_filtered_view(metrics_payload: dict, metric_names: list) -> dict:
+    primary_metrics = metrics_payload.get("metrics", {}) if isinstance(metrics_payload, dict) else {}
+    agent_metrics = metrics_payload.get("agent_metrics", {}) if isinstance(metrics_payload, dict) else {}
+
+    requested_metric_names = [str(name).strip() for name in (metric_names or []) if str(name).strip()]
+    lookup = {}
+
+    for key, value in primary_metrics.items():
+        lookup[_canonical_metric_name(key)] = ("metrics", key, value)
+    for key, value in agent_metrics.items():
+        lookup[_canonical_metric_name(key)] = ("agent_metrics", key, value)
+
+    selected_primary = {}
+    selected_agent = {}
+    resolved_metric_names = []
+    missing_metric_names = []
+
+    for requested_name in requested_metric_names:
+        canonical = _canonical_metric_name(requested_name)
+        hit = lookup.get(canonical)
+        if not hit:
+            missing_metric_names.append(requested_name)
+            continue
+
+        bucket_name, key, value = hit
+        resolved_metric_names.append(key)
+        if bucket_name == "metrics":
+            selected_primary[key] = value
+        else:
+            selected_agent[key] = value
+
+    return {
+        "metrics": selected_primary,
+        "agent_metrics": selected_agent,
+        "requested_metric_names": requested_metric_names,
+        "resolved_metric_names": sorted(set(resolved_metric_names)),
+        "missing_metric_names": missing_metric_names,
+        "availability_summary": {
+            "primary": _summarize_metric_bucket(selected_primary),
+            "agent": _summarize_metric_bucket(selected_agent),
+        },
+    }
+
+
 @mcp.tool()
 async def aws_list_ec2_instances(tag_filter: dict = None) -> dict:
     """
@@ -165,6 +318,10 @@ async def aws_create_ec2_instance(
     ram: int = 4,
     tags: dict = None,
     instance_type: str = None,
+    os_name: str = "amazon-linux-2023",
+    vpc_id: str = "default",
+    security_group_id: str = "default",
+    auto_assign_public_ip: bool = True,
 ) -> dict:
     """
     Create a new EC2 instance with specified resources.
@@ -177,6 +334,10 @@ async def aws_create_ec2_instance(
         ram: RAM in gigabytes (default: 4)
         tags: Optional tags for policy/budget attribution (Environment, Project, etc.)
         instance_type: Optional explicit instance type override
+        os_name: OS selector (default: amazon-linux-2023; supports explicit ami-...)
+        vpc_id: Target VPC ID or Name tag (default: default VPC)
+        security_group_id: Security group ID or name (default: default SG in selected VPC)
+        auto_assign_public_ip: Auto-assign public IPv4 on primary ENI (default: true)
     
     Returns:
         Dictionary with success status, message, and instance details
@@ -188,6 +349,10 @@ async def aws_create_ec2_instance(
             ram=ram,
             tags=tags,
             instance_type=instance_type,
+            os_name=os_name,
+            vpc_id=vpc_id,
+            security_group_id=security_group_id,
+            auto_assign_public_ip=auto_assign_public_ip,
         )
         return {
             "success": True,
@@ -589,6 +754,10 @@ async def aws_analyze_ec2_cost_optimization(
     cpu_idle_threshold_percent: float = 15.0,
     cpu_hot_threshold_percent: float = 70.0,
     network_idle_threshold_bytes_per_period: float = 50000.0,
+    include_memory_disk_signals: bool = True,
+    memory_pressure_threshold_percent: float = 75.0,
+    disk_pressure_threshold_percent: float = 80.0,
+    swap_pressure_threshold_percent: float = 50.0,
     allowed_families: list = None,
     include_compute_optimizer: bool = True,
 ) -> dict:
@@ -605,6 +774,10 @@ async def aws_analyze_ec2_cost_optimization(
             cpu_idle_threshold_percent=cpu_idle_threshold_percent,
             cpu_hot_threshold_percent=cpu_hot_threshold_percent,
             network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+            include_extended_signals=include_memory_disk_signals,
+            memory_pressure_threshold_percent=memory_pressure_threshold_percent,
+            disk_pressure_threshold_percent=disk_pressure_threshold_percent,
+            swap_pressure_threshold_percent=swap_pressure_threshold_percent,
         )
 
         cheapest = ec2_manager.get_cheapest_compatible_instance_type(
@@ -648,6 +821,10 @@ async def aws_analyze_ec2_fleet_cost_optimization(
     cpu_idle_threshold_percent: float = 15.0,
     cpu_hot_threshold_percent: float = 70.0,
     network_idle_threshold_bytes_per_period: float = 50000.0,
+    include_memory_disk_signals: bool = True,
+    memory_pressure_threshold_percent: float = 75.0,
+    disk_pressure_threshold_percent: float = 80.0,
+    swap_pressure_threshold_percent: float = 50.0,
     allowed_families: list = None,
     max_instances: int = 50,
 ) -> dict:
@@ -671,6 +848,10 @@ async def aws_analyze_ec2_fleet_cost_optimization(
                 cpu_idle_threshold_percent=cpu_idle_threshold_percent,
                 cpu_hot_threshold_percent=cpu_hot_threshold_percent,
                 network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+                include_extended_signals=include_memory_disk_signals,
+                memory_pressure_threshold_percent=memory_pressure_threshold_percent,
+                disk_pressure_threshold_percent=disk_pressure_threshold_percent,
+                swap_pressure_threshold_percent=swap_pressure_threshold_percent,
             )
             cheapest = ec2_manager.get_cheapest_compatible_instance_type(
                 instance_id=instance_id,
@@ -1581,16 +1762,74 @@ async def aws_get_ec2_metrics(
                 "error": "Missing instance_id. Provide one or set CW_TEST_INSTANCE_ID in environment."
             }
 
-        metrics = cloudwatch_manager.get_ec2_metrics(
+        metrics_payload = cloudwatch_manager.get_ec2_metrics(
             instance_id=resolved_instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
             include_agent_metrics=include_agent_metrics,
             agent_namespace=agent_namespace,
         )
+
         return {
             "success": True,
-            "metrics": metrics
+            "metrics": metrics_payload
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+async def aws_get_ec2_metrics_scoped(
+    instance_id: str = None,
+    scope: str = "all",
+    minutes: int = 15,
+    period_seconds: int = 60,
+    include_agent_metrics: bool = True,
+    agent_namespace: str = "CWAgent",
+) -> dict:
+    """
+    Get a scoped subset of EC2 metrics instead of returning the full metrics bundle.
+
+    Supported scope values:
+    - all
+    - cpu
+    - network
+    - status
+    - disk
+    - memory
+    """
+    try:
+        resolved_instance_id = instance_id or default_instance_id
+        if not resolved_instance_id:
+            return {
+                "success": False,
+                "error": "Missing instance_id. Provide one or set CW_TEST_INSTANCE_ID in environment."
+            }
+
+        metrics_payload = cloudwatch_manager.get_ec2_metrics(
+            instance_id=resolved_instance_id,
+            minutes=minutes,
+            period_seconds=period_seconds,
+            include_agent_metrics=include_agent_metrics,
+            agent_namespace=agent_namespace,
+        )
+
+        scoped_view = _build_scoped_metrics_view(metrics_payload, scope)
+
+        return {
+            "success": True,
+            "instance_id": resolved_instance_id,
+            "minutes": minutes,
+            "period_seconds": period_seconds,
+            "scope": scoped_view.get("scope"),
+            "metrics": scoped_view.get("metrics", {}),
+            "agent_metrics": scoped_view.get("agent_metrics", {}),
+            "availability_summary": scoped_view.get("availability_summary", {}),
+            "interpretation_guardrails": metrics_payload.get("interpretation_guardrails", []),
+            "warnings": metrics_payload.get("warnings", []),
         }
     except Exception as e:
         return {

@@ -720,6 +720,10 @@ class CloudWatchManager:
         cpu_idle_threshold_percent: float = 15.0,
         cpu_hot_threshold_percent: float = 70.0,
         network_idle_threshold_bytes_per_period: float = 50000.0,
+        include_extended_signals: bool = True,
+        memory_pressure_threshold_percent: float = 75.0,
+        disk_pressure_threshold_percent: float = 80.0,
+        swap_pressure_threshold_percent: float = 50.0,
     ) -> Dict:
         """
         Analyze EC2 utilization to produce a rightsizing recommendation signal.
@@ -728,18 +732,28 @@ class CloudWatchManager:
             instance_id=instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
-            include_agent_metrics=False,
+            include_agent_metrics=include_extended_signals,
         )
         metrics = metrics_payload.get('metrics', {})
+        agent_metrics = metrics_payload.get('agent_metrics', {})
 
         cpu_values = self._extract_metric_values(metrics, 'CPUUtilization')
         network_in_values = self._extract_metric_values(metrics, 'NetworkIn')
         network_out_values = self._extract_metric_values(metrics, 'NetworkOut')
+        memory_values = self._extract_metric_values(agent_metrics, 'mem_used_percent')
+        disk_values = self._extract_metric_values(agent_metrics, 'disk_used_percent')
+        swap_values = self._extract_metric_values(agent_metrics, 'swap_used_percent')
 
         cpu_avg = self._safe_avg(cpu_values)
         cpu_max = max(cpu_values) if cpu_values else None
         network_in_avg = self._safe_avg(network_in_values)
         network_out_avg = self._safe_avg(network_out_values)
+        memory_avg = self._safe_avg(memory_values)
+        memory_max = max(memory_values) if memory_values else None
+        disk_avg = self._safe_avg(disk_values)
+        disk_max = max(disk_values) if disk_values else None
+        swap_avg = self._safe_avg(swap_values)
+        swap_max = max(swap_values) if swap_values else None
         network_total_avg = None
         if network_in_avg is not None and network_out_avg is not None:
             network_total_avg = network_in_avg + network_out_avg
@@ -761,6 +775,29 @@ class CloudWatchManager:
                 recommendation = 'keep'
                 reason = f"Utilization appears balanced: avg CPU {cpu_avg:.2f}%"
 
+        extended_signal_findings = []
+        if include_extended_signals:
+            if memory_max is not None and memory_max >= memory_pressure_threshold_percent:
+                extended_signal_findings.append(
+                    f"Memory pressure detected (max mem_used_percent {memory_max:.2f}% >= {memory_pressure_threshold_percent:.2f}%)"
+                )
+            if disk_max is not None and disk_max >= disk_pressure_threshold_percent:
+                extended_signal_findings.append(
+                    f"Disk pressure detected (max disk_used_percent {disk_max:.2f}% >= {disk_pressure_threshold_percent:.2f}%)"
+                )
+            if swap_max is not None and swap_max >= swap_pressure_threshold_percent:
+                extended_signal_findings.append(
+                    f"Swap pressure detected (max swap_used_percent {swap_max:.2f}% >= {swap_pressure_threshold_percent:.2f}%)"
+                )
+
+            # Use extended metrics as a safety guardrail when available.
+            if extended_signal_findings and recommendation in {'downsize', 'keep'}:
+                recommendation = 'investigate'
+                reason = (
+                    "Baseline CPU/network suggested non-critical utilization, but extended memory/disk/swap signals indicate pressure. "
+                    "Review instance sizing and host storage before applying cost reduction."
+                )
+
         return {
             'instance_id': instance_id,
             'window_minutes': minutes,
@@ -771,17 +808,54 @@ class CloudWatchManager:
                 'network_in_avg_bytes_per_period': network_in_avg,
                 'network_out_avg_bytes_per_period': network_out_avg,
                 'network_total_avg_bytes_per_period': network_total_avg,
+                'memory_avg_percent': memory_avg,
+                'memory_max_percent': memory_max,
+                'disk_avg_percent': disk_avg,
+                'disk_max_percent': disk_max,
+                'swap_avg_percent': swap_avg,
+                'swap_max_percent': swap_max,
                 'datapoint_count': {
                     'cpu': len(cpu_values),
                     'network_in': len(network_in_values),
                     'network_out': len(network_out_values),
+                    'memory': len(memory_values),
+                    'disk': len(disk_values),
+                    'swap': len(swap_values),
                 },
             },
             'thresholds': {
                 'cpu_idle_threshold_percent': cpu_idle_threshold_percent,
                 'cpu_hot_threshold_percent': cpu_hot_threshold_percent,
                 'network_idle_threshold_bytes_per_period': network_idle_threshold_bytes_per_period,
+                'memory_pressure_threshold_percent': memory_pressure_threshold_percent,
+                'disk_pressure_threshold_percent': disk_pressure_threshold_percent,
+                'swap_pressure_threshold_percent': swap_pressure_threshold_percent,
             },
+            'analysis_basis': {
+                'primary_signals': ['CPUUtilization', 'NetworkIn', 'NetworkOut'],
+                'extended_signals_enabled': include_extended_signals,
+                'extended_signals_considered': [
+                    name
+                    for name, points in [
+                        ('mem_used_percent', len(memory_values)),
+                        ('disk_used_percent', len(disk_values)),
+                        ('swap_used_percent', len(swap_values)),
+                    ]
+                    if points > 0
+                ],
+                'extended_signals_missing': [
+                    name
+                    for name, points in [
+                        ('mem_used_percent', len(memory_values)),
+                        ('disk_used_percent', len(disk_values)),
+                        ('swap_used_percent', len(swap_values)),
+                    ]
+                    if points == 0
+                ]
+                if include_extended_signals
+                else [],
+            },
+            'extended_signal_findings': extended_signal_findings,
             'recommendation': recommendation,
             'reason': reason,
         }
