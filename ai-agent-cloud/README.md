@@ -43,6 +43,7 @@ User: "Create 2 EC2 instances"
 - ✅ **MCP-based architecture** - Decoupled agent and cloud providers
 - ✅ **Observability helper agent** - Dedicated sub-agent for logs/metrics/traces summarization before controller planning
 - ✅ **AWS EC2 management** - Create, list, delete, monitor instances
+- ✅ **Scheduled cost optimization worker** - Deployed on ECS Fargate and triggered weekly by EventBridge Scheduler
 - ✅ **Dynamic tool discovery** - Agent discovers capabilities from MCP servers
 - ✅ **Intelligent resource mapping** - Generic specs (2 CPU, 4GB RAM) → AWS instance types
 - ✅ **Multi-server support** - Architecture supports multiple clouds simultaneously
@@ -54,7 +55,6 @@ User: "Create 2 EC2 instances"
 - 🚧 **Azure VM management** - Parallel to AWS
 - 🚧 **GCP Compute Engine** - Complete multi-cloud
 - 🚧 **Self-healing** - Detect and recover from failures
-- 🚧 **Cost optimization** - Identify and resize underutilized resources
 - 🚧 **Security guardrails** - Policy engine to prevent dangerous operations
 
 ---
@@ -151,11 +151,16 @@ ai-agent-cloud/
 │   ├── architecture.md         # System design
 │   ├── setup_guide.md          # Installation instructions
 │   ├── usage_examples.md       # How to use
-│   └── state_management.md     # State tracking guide
+│   ├── state_management.md     # State tracking guide
+│   └── CostOptimizationServiceGuide.md # ECS Fargate + EventBridge Scheduler cost optimization guide
+├── config/
+│   └── cost_optimization/
+│       └── cost-optimization.worker.env # ECS environment file template for worker task
 ├── state/                      # State tracking (git-ignored)
 │   ├── state.json              # Infrastructure snapshot
 │   └── audit_log.jsonl         # Action history
 ├── main.py                     # Entry point
+├── cost_optimization_worker.py     # Scheduled cost-optimization one-shot worker (ECS Fargate task)
 ├── view_state.py               # View state/statistics
 ├── sync_aws_state.py           # Sync from AWS
 ├── requirements.txt            # Dependencies
@@ -184,14 +189,14 @@ This project investigates:
 
 ## 🛠️ Technology Stack
 
-| Component | Technology                   | Purpose              |
-| --------- | ---------------------------- | -------------------- |
-| AI Agent  | GPT-5.4-mini (OpenAI)        | Planning & reasoning |
-| Helper Agent | GPT-4.1-mini (OpenAI)     | Observability summarization |
-| Protocol  | MCP (Model Context Protocol) | Tool communication   |
-| AWS SDK   | Boto3                        | EC2 management       |
-| Language  | Python 3.8+                  | Implementation       |
-| Async     | asyncio                      | MCP communication    |
+| Component    | Technology                   | Purpose                     |
+| ------------ | ---------------------------- | --------------------------- |
+| AI Agent     | GPT-5.4-mini (OpenAI)        | Planning & reasoning        |
+| Helper Agent | GPT-4.1-mini (OpenAI)        | Observability summarization |
+| Protocol     | MCP (Model Context Protocol) | Tool communication          |
+| AWS SDK      | Boto3                        | EC2 management              |
+| Language     | Python 3.8+                  | Implementation              |
+| Async        | asyncio                      | MCP communication           |
 
 ---
 
@@ -301,6 +306,7 @@ run_agent_sync("List all instances tagged 'ManagedBy: AIAgent' and delete them")
 - **[Usage Examples](docs/usage_examples.md)** - How to use the agent
 - **[State Management](docs/state_management.md)** - State tracking and audit logs
 - **[Code Walkthrough](docs/CODE_WALKTHROUGH.md)** - Comprehensive code explanation
+- **[Cost Optimization Service Guide](docs/CostOptimizationServiceGuide.md)** - Deploy weekly cost optimization on ECS Fargate with EventBridge Scheduler
 - **[Quick Reference](docs/QUICK_REFERENCE.md)** - Quick lookup guide
 
 ---

@@ -31,6 +31,7 @@ build/
 # State files (contains resource IDs and action history)
 state/state.json
 state/audit_log.jsonl
+state/cost_optimization_service_state.json
 
 # Keep state directory structure
 !state/.gitkeep

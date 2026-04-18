@@ -1,0 +1,13 @@
+.git
+.gitignore
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+state
+thesis
+docs
+README.md
+.env
+.env.*

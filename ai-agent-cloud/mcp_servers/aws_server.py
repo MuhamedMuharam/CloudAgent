@@ -170,6 +170,33 @@ def _average(values: list):
     return sum(values) / len(values)
 
 
+def _resolve_cost_metric_period(
+    minutes: int,
+    requested_period_seconds: int,
+    max_datapoints_per_metric: int = 600,
+) -> tuple:
+    safe_minutes = max(1, int(minutes or 1))
+    safe_requested_period = max(60, int(requested_period_seconds or 60))
+    safe_requested_period = ((safe_requested_period + 59) // 60) * 60
+
+    safe_max_datapoints = max(200, int(max_datapoints_per_metric or 1200))
+    window_seconds = safe_minutes * 60
+    minimum_period_from_window = (window_seconds + safe_max_datapoints - 1) // safe_max_datapoints
+    minimum_period_from_window = max(60, minimum_period_from_window)
+    minimum_period_from_window = ((minimum_period_from_window + 59) // 60) * 60
+
+    if safe_requested_period >= minimum_period_from_window:
+        return safe_requested_period, "requested"
+
+    return minimum_period_from_window, "adapted_for_window"
+
+
+def _estimate_datapoints_per_metric(minutes: int, period_seconds: int) -> int:
+    window_seconds = max(1, int(minutes or 1)) * 60
+    safe_period = max(60, int(period_seconds or 60))
+    return max(1, (window_seconds + safe_period - 1) // safe_period)
+
+
 def _summarize_metric_bucket(metrics_bucket: dict) -> dict:
     if not isinstance(metrics_bucket, dict):
         return {
@@ -767,10 +794,15 @@ async def aws_analyze_ec2_cost_optimization(
     Recommendation-only tool by design. It does not mutate infrastructure.
     """
     try:
+        resolved_period_seconds, period_resolution = _resolve_cost_metric_period(
+            minutes=minutes,
+            requested_period_seconds=period_seconds,
+        )
+
         utilization = cloudwatch_manager.analyze_ec2_rightsizing(
             instance_id=instance_id,
             minutes=minutes,
-            period_seconds=period_seconds,
+            period_seconds=resolved_period_seconds,
             cpu_idle_threshold_percent=cpu_idle_threshold_percent,
             cpu_hot_threshold_percent=cpu_hot_threshold_percent,
             network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
@@ -797,6 +829,16 @@ async def aws_analyze_ec2_cost_optimization(
             "success": True,
             "instance_id": instance_id,
             "analysis_mode": "recommendation_only",
+            "analysis_window": {
+                "minutes": minutes,
+                "requested_period_seconds": period_seconds,
+                "resolved_period_seconds": resolved_period_seconds,
+                "period_resolution": period_resolution,
+                "estimated_datapoints_per_metric": _estimate_datapoints_per_metric(
+                    minutes=minutes,
+                    period_seconds=resolved_period_seconds,
+                ),
+            },
             "utilization_analysis": utilization,
             "agent_attribute_based_recommendation": cheapest,
             "compute_optimizer": compute_optimizer,
@@ -832,6 +874,11 @@ async def aws_analyze_ec2_fleet_cost_optimization(
     Analyze multiple running EC2 instances and produce recommendation-only rightsizing output.
     """
     try:
+        resolved_period_seconds, period_resolution = _resolve_cost_metric_period(
+            minutes=minutes,
+            requested_period_seconds=period_seconds,
+        )
+
         instances = ec2_manager.list_instances()
         running_instances = [inst for inst in instances if inst.get('state') == 'running'][:max_instances]
 
@@ -844,7 +891,7 @@ async def aws_analyze_ec2_fleet_cost_optimization(
             utilization = cloudwatch_manager.analyze_ec2_rightsizing(
                 instance_id=instance_id,
                 minutes=minutes,
-                period_seconds=period_seconds,
+                period_seconds=resolved_period_seconds,
                 cpu_idle_threshold_percent=cpu_idle_threshold_percent,
                 cpu_hot_threshold_percent=cpu_hot_threshold_percent,
                 network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
@@ -877,6 +924,16 @@ async def aws_analyze_ec2_fleet_cost_optimization(
         return {
             'success': True,
             'analysis_mode': 'recommendation_only',
+            'analysis_window': {
+                'minutes': minutes,
+                'requested_period_seconds': period_seconds,
+                'resolved_period_seconds': resolved_period_seconds,
+                'period_resolution': period_resolution,
+                'estimated_datapoints_per_metric': _estimate_datapoints_per_metric(
+                    minutes=minutes,
+                    period_seconds=resolved_period_seconds,
+                ),
+            },
             'instance_count': len(analyses),
             'instances': analyses,
             'estimated_hourly_savings': total_hourly_savings,

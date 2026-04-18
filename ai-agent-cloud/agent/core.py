@@ -132,6 +132,7 @@ INSTRUCTION_PACKS = {
         "COST OPTIMIZATION MODE:\n"
         "- If no explicit execution intent is present, provide recommendations, rationale, and projected savings only\n"
         "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
+        "- For long lookback windows, ensure period_seconds keeps per-metric datapoints manageable (prefer <=300 datapoints)\n"
         "- In execution mode, run aws_resize_ec2_instance with dry_run=true first to validate compatibility and target choice\n"
         "- Apply with aws_apply_ec2_rightsizing only when compatibility is true and estimated_hourly_savings is positive\n"
         "- For resize actions, require compatibility checks and backup plan before changes\n"
