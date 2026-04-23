@@ -56,5 +56,5 @@ htmlcov/
 # Thesis writing workspace
 thesis/
 
-
-
+CLAUDE.md
+settings.local.json

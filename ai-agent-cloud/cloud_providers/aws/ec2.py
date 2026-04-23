@@ -4,6 +4,7 @@ Handles all EC2 instance operations using boto3.
 """
 
 import sys
+import math
 import time
 import shlex
 import boto3
@@ -37,7 +38,17 @@ class EC2Manager:
         self.ssm_client = boto3.client('ssm', region_name=region)
         self.ssm_manager = SSMManager(region=region)
         self.compute_optimizer_client = boto3.client('compute-optimizer', region_name=region)
-    
+        self._account_id: Optional[str] = None
+
+    def _get_account_id(self) -> str:
+        if self._account_id is None:
+            sts = boto3.client('sts', region_name=self.region)
+            self._account_id = sts.get_caller_identity()['Account']
+        return self._account_id
+
+    def get_instance_arn(self, instance_id: str) -> str:
+        return f"arn:aws:ec2:{self.region}:{self._get_account_id()}:instance/{instance_id}"
+
     def list_instances(self, tag_filter: Optional[Dict[str, str]] = None) -> List[Dict]:
         """
         List all EC2 instances, optionally filtered by tags.
@@ -917,6 +928,175 @@ class EC2Manager:
             'estimated_hourly_cost_recommended': target_hourly,
             'estimated_hourly_savings': max(0.0, current_hourly - target_hourly),
             'estimated_monthly_savings': max(0.0, (current_hourly - target_hourly) * 24 * 30),
+        }
+
+    def get_rightsizing_recommendation(
+        self,
+        instance_id: str,
+        utilization: Dict,
+        allowed_families: Optional[List[str]] = None,
+        cpu_headroom_multiplier: float = 3.0,
+        ram_headroom_multiplier: float = 1.5,
+    ) -> Dict:
+        """
+        Utilization-aware rightsizing recommendation.
+
+        Derives minimum safe target specs from cpu_max_percent and memory_max_percent
+        (with configurable headroom multipliers), then finds the cheapest compatible
+        instance that meets those minimums at lower cost than current.
+
+        Classifies the result as:
+          - capacity_reduction: recommended type has fewer vCPUs or less RAM
+          - cross_family_cost_optimization: same specs, cheaper family (e.g. t3 -> t3a)
+          - no_change: no cheaper compatible candidate meets the safety floor
+        """
+        current = self.get_instance_status(instance_id)
+        current_type = current.get('type')
+        current_specs = get_instance_type_specs(current_type) or {'vcpu': 2, 'ram_gb': 4}
+        current_vcpu = float(current_specs['vcpu'])
+        current_ram = float(current_specs['ram_gb'])
+        current_hourly = get_estimated_hourly_cost(current_type)
+
+        families_tuple: Optional[Tuple[str, ...]] = None
+        if allowed_families:
+            cleaned = [f.strip() for f in allowed_families if str(f).strip()]
+            if cleaned:
+                families_tuple = tuple(cleaned)
+
+        metrics = utilization.get('metrics_summary', {})
+        cpu_max = metrics.get('cpu_max_percent')
+        cpu_avg = metrics.get('cpu_avg_percent')
+        memory_max = metrics.get('memory_max_percent')
+
+        # Prefer cpu_max; fall back to 2× cpu_avg as a conservative proxy.
+        cpu_signal = cpu_max if cpu_max is not None else (cpu_avg * 2.0 if cpu_avg is not None else None)
+
+        if cpu_signal is not None:
+            target_vcpu = max(1.0, math.ceil(current_vcpu * cpu_signal / 100.0 * cpu_headroom_multiplier))
+        else:
+            target_vcpu = current_vcpu
+
+        if memory_max is not None:
+            target_ram: Optional[float] = max(0.5, current_ram * memory_max / 100.0 * ram_headroom_multiplier)
+        else:
+            target_ram = None
+
+        candidates = []
+        for item in get_instance_catalog():
+            candidate_type = str(item['instance_type'])
+            candidate_vcpu = float(item['vcpu'])
+            candidate_ram = float(item['ram_gb'])
+            candidate_hourly = float(item['hourly_cost'])
+
+            if candidate_type == current_type:
+                continue
+            if candidate_hourly >= current_hourly:
+                continue
+            if candidate_vcpu < target_vcpu:
+                continue
+            if target_ram is not None and candidate_ram < target_ram:
+                continue
+            if candidate_vcpu > current_vcpu or candidate_ram > current_ram:
+                continue
+
+            candidate_family = candidate_type.split('.')[0]
+            if families_tuple and candidate_family not in families_tuple:
+                continue
+
+            compat = self.get_instance_type_compatibility(current_type, candidate_type)
+            if not compat.get('compatible'):
+                continue
+
+            candidates.append((candidate_hourly, -candidate_ram, -candidate_vcpu, candidate_type, compat))
+
+        if not candidates:
+            if target_ram is not None:
+                rationale = (
+                    f"No cheaper compatible instance found meeting safety minimums "
+                    f"(>= {target_vcpu:.0f} vCPU, >= {target_ram:.2f} GB RAM). "
+                    f"Signals: cpu_max={cpu_signal:.1f}%, memory_max={memory_max:.1f}%."
+                    if cpu_signal is not None and memory_max is not None else
+                    f"No cheaper compatible instance found meeting safety minimums "
+                    f"(>= {target_vcpu:.0f} vCPU, >= {target_ram:.2f} GB RAM)."
+                )
+            else:
+                rationale = (
+                    f"No cheaper compatible instance found (>= {target_vcpu:.0f} vCPU). "
+                    f"No memory signal available to further constrain selection."
+                )
+            return {
+                'instance_id': instance_id,
+                'current_instance_type': current_type,
+                'recommended_instance_type': current_type,
+                'recommendation_type': 'no_change',
+                'recommendation_rationale': rationale,
+                'computed_target_specs': {
+                    'min_vcpu': target_vcpu,
+                    'min_ram_gb': target_ram,
+                    'cpu_signal_used_percent': cpu_signal,
+                    'memory_signal_used_percent': memory_max,
+                },
+                'estimated_hourly_cost_current': current_hourly,
+                'estimated_hourly_cost_recommended': current_hourly,
+                'estimated_hourly_savings': 0.0,
+                'estimated_monthly_savings': 0.0,
+            }
+
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        best_hourly, _, _, best_type, best_compat = candidates[0]
+        best_specs = get_instance_type_specs(best_type) or {'vcpu': 2, 'ram_gb': 4}
+        best_vcpu = float(best_specs['vcpu'])
+        best_ram = float(best_specs['ram_gb'])
+
+        is_vcpu_reduced = best_vcpu < current_vcpu
+        is_ram_reduced = best_ram < current_ram
+
+        if is_vcpu_reduced or is_ram_reduced:
+            recommendation_type = 'capacity_reduction'
+            parts = []
+            if is_vcpu_reduced:
+                parts.append(f"vCPU {current_vcpu:.0f} -> {best_vcpu:.0f}")
+            if is_ram_reduced:
+                parts.append(f"RAM {current_ram:.1f} -> {best_ram:.1f} GB")
+            signal_desc = (
+                f"cpu_max {cpu_signal:.1f}% -> target_vcpu {target_vcpu:.0f}"
+                if cpu_signal is not None else "no cpu signal"
+            )
+            mem_desc = (
+                f", memory_max {memory_max:.1f}% -> target_ram {target_ram:.2f} GB"
+                if memory_max is not None and target_ram is not None else ""
+            )
+            rationale = f"Genuine capacity reduction ({', '.join(parts)}). Justified by: {signal_desc}{mem_desc}."
+        else:
+            recommendation_type = 'cross_family_cost_optimization'
+            current_family = current_type.split('.')[0]
+            best_family = best_type.split('.')[0]
+            rationale = (
+                f"Same effective capacity ({best_vcpu:.0f} vCPU, {best_ram:.1f} GB RAM) at lower cost "
+                f"by switching from {current_family} to {best_family}. Specs are preserved — not a real downsize."
+            )
+
+        return {
+            'instance_id': instance_id,
+            'current_instance_type': current_type,
+            'recommended_instance_type': best_type,
+            'recommendation_type': recommendation_type,
+            'recommendation_rationale': rationale,
+            'capacity_change': {
+                'vcpu': {'current': current_vcpu, 'recommended': best_vcpu, 'reduced': is_vcpu_reduced},
+                'ram_gb': {'current': current_ram, 'recommended': best_ram, 'reduced': is_ram_reduced},
+            },
+            'computed_target_specs': {
+                'min_vcpu': target_vcpu,
+                'min_ram_gb': target_ram,
+                'cpu_signal_used_percent': cpu_signal,
+                'memory_signal_used_percent': memory_max,
+            },
+            'compatibility': best_compat,
+            'estimated_hourly_cost_current': current_hourly,
+            'estimated_hourly_cost_recommended': best_hourly,
+            'estimated_hourly_savings': max(0.0, current_hourly - best_hourly),
+            'estimated_monthly_savings': max(0.0, (current_hourly - best_hourly) * 24 * 30),
         }
 
     def resize_instance_type(

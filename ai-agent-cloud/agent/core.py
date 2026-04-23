@@ -14,9 +14,10 @@ import asyncio  # For async MCP communication
 import json
 import os
 import sys
+import time
 from typing import Dict, List, Set
 from dotenv import load_dotenv  # Load .env file with credentials
-from openai import OpenAI  # GPT-4 for planning and reasoning
+from openai import OpenAI, RateLimitError  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
 from .state_manager import StateManager  # State tracking and audit logs
 from .policy_engine import PolicyEngine, PolicyViolation  # Policy validation
@@ -137,6 +138,22 @@ INSTRUCTION_PACKS = {
         "- Apply with aws_apply_ec2_rightsizing only when compatibility is true and estimated_hourly_savings is positive\n"
         "- For resize actions, require compatibility checks and backup plan before changes\n"
         "- When calling aws_apply_ec2_rightsizing, do not set min_cpu/min_ram_gb unless the user explicitly asked for hard minimum capacity\n"
+        "- After a successful resize (mode=applied), call aws_sync_asg_launch_template_after_resize if the instance may be part of an ASG\n"
+    ),
+    "asg_scaling": (
+        "AUTO SCALING GROUP (ASG) OPERATIONS:\n"
+        "- Before modifying an ASG, call aws_describe_asg to understand its current state, launch template, and instance health\n"
+        "- Prefer TargetTrackingScaling over SimpleScaling/StepScaling unless user specifies otherwise — it requires less manual tuning\n"
+        "- When adding a scaling policy, use aws_put_asg_scaling_policy; existing policy with same name is updated in-place\n"
+        "- For SimpleScaling and StepScaling policies, a CloudWatch alarm may be required at policy creation time:\n"
+        "  * If the user explicitly asks to attach an alarm, pass its name via alarm_name in aws_put_asg_scaling_policy\n"
+        "  * If no alarm is mentioned, create the policy without alarm_name \n"
+        "  * If the user asks to also create a new alarm for it, call aws_create_cloudwatch_alarm first, then pass alarm_name\n"
+        "  * TargetTrackingScaling never needs an alarm — AWS manages scaling automatically\n"
+        "- When syncing a vertical resize to the ASG launch template, use aws_sync_asg_launch_template_after_resize — it is a single compound call\n"
+        "- aws_sync_asg_launch_template_after_resize is a no-op (synced=false) when the instance is not in an ASG; this is expected\n"
+        "- Launch template updates affect only future scale-out events; existing ASG instances keep their current type\n"
+        "- To check if an instance is in an ASG before syncing, call aws_get_instance_asg first\n"
     ),
 }
 
@@ -252,6 +269,9 @@ def build_system_prompt(goal: str) -> str:
 
     if any(k in goal_text for k in ["cost", "optimiz", "rightsiz", "saving", "cheapest", "compute optimizer"]):
         parts.append(INSTRUCTION_PACKS["cost_optimization"])
+
+    if any(k in goal_text for k in ["asg", "auto scal", "autoscal", "launch template", "scaling policy", "scale out", "scale in"]):
+        parts.append(INSTRUCTION_PACKS["asg_scaling"])
 
     parts.append("Complete tasks immediately and report what you did.")
     return "\n\n".join(parts)
@@ -582,13 +602,22 @@ async def run_agent(goal: str, mcp_servers: list = None):
         while iteration < max_iterations:
             iteration += 1
             
-            # Call OpenAI with available tools
-            response = client.chat.completions.create(
-                model=controller_model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
+            # Call OpenAI with available tools (retry on rate limit)
+            for _attempt in range(4):
+                try:
+                    response = client.chat.completions.create(
+                        model=controller_model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto"
+                    )
+                    break
+                except RateLimitError as _rle:
+                    if _attempt == 3:
+                        raise
+                    _wait = 15 * (2 ** _attempt)  # 15s, 30s, 60s
+                    print(f"⏳ Rate limit hit, retrying in {_wait}s... ({_rle})")
+                    time.sleep(_wait)
             
             msg = response.choices[0].message
             
@@ -710,6 +739,12 @@ async def run_agent(goal: str, mcp_servers: list = None):
                             'aws_apply_ec2_rightsizing',
                             'aws_stop_ec2_instance',
                             'aws_delete_ec2_instance',
+                            'aws_sync_asg_launch_template_after_resize',
+                            'aws_update_asg_launch_template',
+                            'aws_create_launch_template_version',
+                            'aws_set_launch_template_default_version',
+                            'aws_put_asg_scaling_policy',
+                            'aws_delete_asg_scaling_policy',
                         }:
                             blocked_msg = (
                                 "Recommendation-only mode is active for this cost optimization goal. "

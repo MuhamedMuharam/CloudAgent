@@ -720,6 +720,8 @@ class CloudWatchManager:
         cpu_idle_threshold_percent: float = 15.0,
         cpu_hot_threshold_percent: float = 70.0,
         network_idle_threshold_bytes_per_period: float = 50000.0,
+        network_idle_threshold_bytes_per_second: Optional[float] = None,
+        cpu_peak_cap_percent: float = 50.0,
         include_extended_signals: bool = True,
         memory_pressure_threshold_percent: float = 75.0,
         disk_pressure_threshold_percent: float = 80.0,
@@ -758,19 +760,43 @@ class CloudWatchManager:
         if network_in_avg is not None and network_out_avg is not None:
             network_total_avg = network_in_avg + network_out_avg
 
+        # Normalize network threshold to the actual metric period so the value stays
+        # meaningful regardless of what period the adaptive resolver picked.
+        effective_network_threshold = (
+            network_idle_threshold_bytes_per_second * period_seconds
+            if network_idle_threshold_bytes_per_second is not None
+            else network_idle_threshold_bytes_per_period
+        )
+
         recommendation = 'investigate'
         reason = 'Insufficient signal to classify utilization trend.'
 
-        if cpu_avg is not None and network_total_avg is not None:
-            if cpu_avg <= cpu_idle_threshold_percent and network_total_avg <= network_idle_threshold_bytes_per_period:
-                recommendation = 'downsize'
-                reason = (
-                    f"Low utilization detected: avg CPU {cpu_avg:.2f}% and avg network "
-                    f"{network_total_avg:.2f} bytes/period"
-                )
-            elif cpu_avg >= cpu_hot_threshold_percent:
+        # CPU is the primary signal; network is a secondary veto only when it clearly
+        # exceeds background agent noise (3× the floor). This prevents false "keep"
+        # results on idle instances where SSM/CW-Agent traffic alone sits above the floor.
+        NETWORK_VETO_MULTIPLIER = 3
+
+        if cpu_avg is not None:
+            if cpu_avg >= cpu_hot_threshold_percent:
                 recommendation = 'upsize'
                 reason = f"High utilization detected: avg CPU {cpu_avg:.2f}%"
+            elif cpu_avg <= cpu_idle_threshold_percent:
+                network_veto_threshold = effective_network_threshold * NETWORK_VETO_MULTIPLIER
+                if network_total_avg is not None and network_total_avg > network_veto_threshold:
+                    recommendation = 'keep'
+                    reason = (
+                        f"CPU is idle ({cpu_avg:.2f}%) but network activity "
+                        f"({network_total_avg:.0f} b/period) exceeds background noise floor "
+                        f"({network_veto_threshold:.0f} b/period) — likely active workload"
+                    )
+                else:
+                    recommendation = 'downsize'
+                    network_note = (
+                        f", network {network_total_avg:.0f} b/period is within background range"
+                        if network_total_avg is not None
+                        else ""
+                    )
+                    reason = f"Low utilization: avg CPU {cpu_avg:.2f}%{network_note}"
             else:
                 recommendation = 'keep'
                 reason = f"Utilization appears balanced: avg CPU {cpu_avg:.2f}%"
@@ -797,6 +823,15 @@ class CloudWatchManager:
                     "Baseline CPU/network suggested non-critical utilization, but extended memory/disk/swap signals indicate pressure. "
                     "Review instance sizing and host storage before applying cost reduction."
                 )
+
+        # Protect bursty workloads: avg can be low while peak is high (e.g. batch jobs, web spikes).
+        if recommendation == 'downsize' and cpu_max is not None and cpu_max > cpu_peak_cap_percent:
+            recommendation = 'investigate'
+            reason = (
+                f"Avg CPU ({cpu_avg:.2f}%) is below the idle threshold but peak CPU ({cpu_max:.2f}%) "
+                f"exceeds the burst cap ({cpu_peak_cap_percent:.2f}%). The instance likely has a "
+                f"bursty workload — review the traffic pattern before downsizing."
+            )
 
         return {
             'instance_id': instance_id,
@@ -826,7 +861,9 @@ class CloudWatchManager:
             'thresholds': {
                 'cpu_idle_threshold_percent': cpu_idle_threshold_percent,
                 'cpu_hot_threshold_percent': cpu_hot_threshold_percent,
-                'network_idle_threshold_bytes_per_period': network_idle_threshold_bytes_per_period,
+                'cpu_peak_cap_percent': cpu_peak_cap_percent,
+                'network_idle_threshold_bytes_per_second': network_idle_threshold_bytes_per_second,
+                'effective_network_idle_threshold_bytes_per_period': effective_network_threshold,
                 'memory_pressure_threshold_percent': memory_pressure_threshold_percent,
                 'disk_pressure_threshold_percent': disk_pressure_threshold_percent,
                 'swap_pressure_threshold_percent': swap_pressure_threshold_percent,

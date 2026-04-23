@@ -13,6 +13,7 @@ import ast
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -256,6 +257,7 @@ def _select_resize_candidates(
     min_primary_datapoints: int,
     require_downsize_signal: bool,
     require_no_extended_findings: bool,
+    skip_cross_family: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     selected = []
     skipped = []
@@ -264,9 +266,12 @@ def _select_resize_candidates(
         instance_id = str(instance.get("instance_id") or "")
         current_type = str(instance.get("current_instance_type") or "")
 
-        recommendation = instance.get("recommendation", {}) if isinstance(instance, dict) else {}
+        recommendation = (
+            instance.get("rightsizing_recommendation") or instance.get("recommendation") or {}
+        ) if isinstance(instance, dict) else {}
         utilization = instance.get("utilization_analysis", {}) if isinstance(instance, dict) else {}
 
+        rec_type = str(recommendation.get("recommendation_type") or "")
         target_type = str(recommendation.get("recommended_instance_type") or "")
         estimated_monthly_savings = float(recommendation.get("estimated_monthly_savings", 0.0) or 0.0)
         utilization_signal = str(utilization.get("recommendation") or "")
@@ -279,6 +284,8 @@ def _select_resize_candidates(
             skip_reasons.append("missing_instance_id")
         if allowed_instance_ids and instance_id not in allowed_instance_ids:
             skip_reasons.append("instance_not_in_allowlist")
+        if skip_cross_family and rec_type == "cross_family_cost_optimization":
+            skip_reasons.append("cross_family_optimization_skipped")
         if not target_type or target_type == current_type:
             skip_reasons.append("no_better_target")
         if estimated_monthly_savings < min_monthly_savings:
@@ -294,6 +301,7 @@ def _select_resize_candidates(
             skipped.append(
                 {
                     "instance_id": instance_id,
+                    "instance_name": instance.get("instance_name") if isinstance(instance, dict) else None,
                     "current_instance_type": current_type,
                     "target_instance_type": target_type,
                     "estimated_monthly_savings": estimated_monthly_savings,
@@ -345,7 +353,8 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
             "period_seconds": config["analysis_period_seconds"],
             "cpu_idle_threshold_percent": config["cpu_idle_threshold_percent"],
             "cpu_hot_threshold_percent": config["cpu_hot_threshold_percent"],
-            "network_idle_threshold_bytes_per_period": config["network_idle_threshold_bytes_per_period"],
+            "cpu_peak_cap_percent": config["cpu_peak_cap_percent"],
+            "network_idle_threshold_bytes_per_second": config["network_idle_threshold_bytes_per_second"],
             "include_memory_disk_signals": config["include_memory_disk_signals"],
             "memory_pressure_threshold_percent": config["memory_pressure_threshold_percent"],
             "disk_pressure_threshold_percent": config["disk_pressure_threshold_percent"],
@@ -378,7 +387,14 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
             min_primary_datapoints=config["min_primary_datapoints"],
             require_downsize_signal=config["require_downsize_signal"],
             require_no_extended_findings=config["require_no_extended_findings"],
+            skip_cross_family=config["skip_cross_family"],
         )
+
+        skipped_reasons_summary: Dict[str, List[str]] = {}
+        for item in skipped_candidates:
+            label = item.get("instance_name") or item.get("instance_id") or "unknown"
+            for r in item.get("skip_reasons", []):
+                skipped_reasons_summary.setdefault(r, []).append(label)
 
         cycle_result = {
             "success": True,
@@ -388,6 +404,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                 "instance_count": len(instances),
                 "candidate_count": len(selected_candidates),
                 "skipped_count": len(skipped_candidates),
+                "skipped_reasons_summary": skipped_reasons_summary,
                 "estimated_hourly_savings": total_hourly_savings,
                 "estimated_monthly_savings": total_monthly_savings,
             },
@@ -410,6 +427,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                 "recommendation_cycle_completed",
                 candidate_count=len(selected_candidates),
                 skipped_count=len(skipped_candidates),
+                skipped_reasons_summary=skipped_reasons_summary,
                 estimated_monthly_savings=total_monthly_savings,
             )
             return cycle_result
@@ -439,6 +457,8 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                 "prefer_downsize_when_idle": True,
                 "minutes": config["analysis_minutes"],
                 "period_seconds": config["analysis_period_seconds"],
+                "network_idle_threshold_bytes_per_second": config["network_idle_threshold_bytes_per_second"],
+                "cpu_peak_cap_percent": config["cpu_peak_cap_percent"],
                 "ensure_service_continuity": config["ensure_service_continuity"],
                 "strict_service_continuity": config["strict_service_continuity"],
                 "service_recovery_timeout_seconds": config["service_recovery_timeout_seconds"],
@@ -472,6 +492,35 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                 mode=apply_result.get("mode"),
                 estimated_monthly_savings=apply_result.get("estimated_monthly_savings"),
             )
+
+            # Propagate new instance type to the ASG launch template (if applicable)
+            if apply_result.get("success") and str(apply_result.get("mode")) == "applied":
+                resize_result = apply_result.get("result") or {}
+                actual_new_type = str(
+                    resize_result.get("target_instance_type")
+                    or candidate.get("target_instance_type")
+                    or ""
+                )
+                if actual_new_type:
+                    sync_raw = await mcp_client.call_tool(
+                        "aws_sync_asg_launch_template_after_resize",
+                        {"instance_id": instance_id, "new_instance_type": actual_new_type},
+                    )
+                    sync_result = _safe_parse_tool_result(sync_raw)
+                    action_payload["asg_sync_result"] = sync_result
+
+                    _log_event(
+                        logger,
+                        logging.INFO if sync_result.get("success") else logging.WARNING,
+                        "asg_launch_template_sync_finished",
+                        instance_id=instance_id,
+                        new_instance_type=actual_new_type,
+                        synced=sync_result.get("synced"),
+                        asg_name=sync_result.get("asg_name"),
+                        new_lt_version=sync_result.get("new_launch_template_version"),
+                        reason=sync_result.get("reason"),
+                        success=bool(sync_result.get("success")),
+                    )
 
         return cycle_result
 
@@ -520,9 +569,10 @@ def run_cost_optimization_worker() -> int:
         "estimated_primary_datapoints": estimated_primary_datapoints,
         "cpu_idle_threshold_percent": _parse_float_env("COST_OPTIMIZATION_CPU_IDLE_THRESHOLD_PERCENT", 15.0, minimum=1.0),
         "cpu_hot_threshold_percent": _parse_float_env("COST_OPTIMIZATION_CPU_HOT_THRESHOLD_PERCENT", 70.0, minimum=1.0),
-        "network_idle_threshold_bytes_per_period": _parse_float_env(
-            "COST_OPTIMIZATION_NETWORK_IDLE_THRESHOLD_BYTES_PER_PERIOD",
-            150000.0,
+        "cpu_peak_cap_percent": _parse_float_env("COST_OPTIMIZATION_CPU_PEAK_CAP_PERCENT", 50.0, minimum=1.0),
+        "network_idle_threshold_bytes_per_second": _parse_float_env(
+            "COST_OPTIMIZATION_NETWORK_IDLE_THRESHOLD_BYTES_PER_SECOND",
+            555.0,
             minimum=1.0,
         ),
         "include_memory_disk_signals": _parse_bool_env("COST_OPTIMIZATION_INCLUDE_MEMORY_DISK_SIGNALS", True),
@@ -544,8 +594,16 @@ def run_cost_optimization_worker() -> int:
         "allowed_families": _parse_csv_env("COST_OPTIMIZATION_ALLOWED_FAMILIES"),
         "allowed_instance_ids": set(_parse_csv_env("COST_OPTIMIZATION_ALLOWED_INSTANCE_IDS")),
         "max_instances": _parse_int_env("COST_OPTIMIZATION_MAX_INSTANCES", 100, minimum=1),
-        "min_monthly_savings": _parse_float_env("COST_OPTIMIZATION_MIN_MONTHLY_SAVINGS_USD", 10.0, minimum=0.0),
-        "min_primary_datapoints": _parse_int_env("COST_OPTIMIZATION_MIN_PRIMARY_DATAPOINTS", 24, minimum=1),
+        "min_monthly_savings": _parse_float_env("COST_OPTIMIZATION_MIN_MONTHLY_SAVINGS_USD", 1.0, minimum=0.0),
+        "min_primary_datapoints": max(
+            3,
+            math.ceil(
+                _parse_float_env("COST_OPTIMIZATION_MIN_DATA_HOURS", 3.0, minimum=0.5)
+                * 3600.0
+                / analysis_period_seconds
+            ),
+        ),
+        "skip_cross_family": _parse_bool_env("COST_OPTIMIZATION_SKIP_CROSS_FAMILY_OPTIMIZATION", True),
         "max_actions_per_run": _parse_int_env("COST_OPTIMIZATION_MAX_ACTIONS_PER_RUN", 2, minimum=1),
         "require_downsize_signal": _parse_bool_env("COST_OPTIMIZATION_REQUIRE_DOWNSIZE_SIGNAL", True),
         "require_no_extended_findings": _parse_bool_env("COST_OPTIMIZATION_REQUIRE_NO_EXTENDED_FINDINGS", True),
@@ -639,7 +697,7 @@ def run_cost_optimization_worker() -> int:
                         "instance_id": action.get("instance_id"),
                         "mode": apply_result.get("mode"),
                         "result": apply_result.get("result"),
-                        "selection": apply_result.get("selection"),
+                        "rightsizing_recommendation": apply_result.get("rightsizing_recommendation"),
                     },
                     estimated_hourly_savings_usd=float(apply_result.get("estimated_hourly_savings", 0.0) or 0.0),
                     estimated_monthly_savings_usd=float(apply_result.get("estimated_monthly_savings", 0.0) or 0.0),
