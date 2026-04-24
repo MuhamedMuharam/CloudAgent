@@ -23,6 +23,7 @@ from cloud_providers.aws.security import SecurityGroupManager
 from cloud_providers.aws.cloudwatch import CloudWatchManager
 from cloud_providers.aws.ssm import SSMManager
 from cloud_providers.aws.xray import XRayManager
+from cloud_providers.aws.asg import ASGManager
 
 # MCP FastMCP import
 from fastmcp import FastMCP
@@ -57,6 +58,9 @@ try:
 
     xray_manager = XRayManager(region=region)
     print("✅ AWS X-Ray Manager initialized", file=sys.stderr)
+
+    asg_manager = ASGManager(region=region)
+    print("✅ AWS ASG Manager initialized", file=sys.stderr)
 except Exception as e:
     print(f"❌ Failed to initialize AWS Managers: {e}", file=sys.stderr)
     print("⚠️  Make sure AWS credentials are configured", file=sys.stderr)
@@ -780,7 +784,8 @@ async def aws_analyze_ec2_cost_optimization(
     period_seconds: int = 300,
     cpu_idle_threshold_percent: float = 15.0,
     cpu_hot_threshold_percent: float = 70.0,
-    network_idle_threshold_bytes_per_period: float = 50000.0,
+    network_idle_threshold_bytes_per_second: float = 555.0,
+    cpu_peak_cap_percent: float = 50.0,
     include_memory_disk_signals: bool = True,
     memory_pressure_threshold_percent: float = 75.0,
     disk_pressure_threshold_percent: float = 80.0,
@@ -805,23 +810,27 @@ async def aws_analyze_ec2_cost_optimization(
             period_seconds=resolved_period_seconds,
             cpu_idle_threshold_percent=cpu_idle_threshold_percent,
             cpu_hot_threshold_percent=cpu_hot_threshold_percent,
-            network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+            network_idle_threshold_bytes_per_second=network_idle_threshold_bytes_per_second,
+            cpu_peak_cap_percent=cpu_peak_cap_percent,
             include_extended_signals=include_memory_disk_signals,
             memory_pressure_threshold_percent=memory_pressure_threshold_percent,
             disk_pressure_threshold_percent=disk_pressure_threshold_percent,
             swap_pressure_threshold_percent=swap_pressure_threshold_percent,
         )
 
-        cheapest = ec2_manager.get_cheapest_compatible_instance_type(
+        rightsizing = ec2_manager.get_rightsizing_recommendation(
             instance_id=instance_id,
+            utilization=utilization,
             allowed_families=allowed_families,
-            prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
         )
 
         compute_optimizer = None
         if include_compute_optimizer:
             try:
-                compute_optimizer = ec2_manager.get_compute_optimizer_recommendations()
+                instance_arn = ec2_manager.get_instance_arn(instance_id)
+                compute_optimizer = ec2_manager.get_compute_optimizer_recommendations(
+                    instance_arns=[instance_arn]
+                )
             except Exception as compute_opt_error:
                 compute_optimizer = {"error": str(compute_opt_error)}
 
@@ -840,10 +849,10 @@ async def aws_analyze_ec2_cost_optimization(
                 ),
             },
             "utilization_analysis": utilization,
-            "agent_attribute_based_recommendation": cheapest,
+            "rightsizing_recommendation": rightsizing,
             "compute_optimizer": compute_optimizer,
-            "estimated_hourly_savings": cheapest.get('estimated_hourly_savings', 0.0),
-            "estimated_monthly_savings": cheapest.get('estimated_monthly_savings', 0.0),
+            "estimated_hourly_savings": rightsizing.get('estimated_hourly_savings', 0.0),
+            "estimated_monthly_savings": rightsizing.get('estimated_monthly_savings', 0.0),
             "next_action_hint": (
                 "If user explicitly requests execution, call aws_resize_ec2_instance "
                 "with create_backup=true."
@@ -862,7 +871,8 @@ async def aws_analyze_ec2_fleet_cost_optimization(
     period_seconds: int = 300,
     cpu_idle_threshold_percent: float = 15.0,
     cpu_hot_threshold_percent: float = 70.0,
-    network_idle_threshold_bytes_per_period: float = 50000.0,
+    network_idle_threshold_bytes_per_second: float = 555.0,
+    cpu_peak_cap_percent: float = 50.0,
     include_memory_disk_signals: bool = True,
     memory_pressure_threshold_percent: float = 75.0,
     disk_pressure_threshold_percent: float = 80.0,
@@ -894,20 +904,21 @@ async def aws_analyze_ec2_fleet_cost_optimization(
                 period_seconds=resolved_period_seconds,
                 cpu_idle_threshold_percent=cpu_idle_threshold_percent,
                 cpu_hot_threshold_percent=cpu_hot_threshold_percent,
-                network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+                network_idle_threshold_bytes_per_second=network_idle_threshold_bytes_per_second,
+                cpu_peak_cap_percent=cpu_peak_cap_percent,
                 include_extended_signals=include_memory_disk_signals,
                 memory_pressure_threshold_percent=memory_pressure_threshold_percent,
                 disk_pressure_threshold_percent=disk_pressure_threshold_percent,
                 swap_pressure_threshold_percent=swap_pressure_threshold_percent,
             )
-            cheapest = ec2_manager.get_cheapest_compatible_instance_type(
+            rightsizing = ec2_manager.get_rightsizing_recommendation(
                 instance_id=instance_id,
+                utilization=utilization,
                 allowed_families=allowed_families,
-                prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
             )
 
-            hourly_savings = float(cheapest.get('estimated_hourly_savings', 0.0) or 0.0)
-            monthly_savings = float(cheapest.get('estimated_monthly_savings', 0.0) or 0.0)
+            hourly_savings = float(rightsizing.get('estimated_hourly_savings', 0.0) or 0.0)
+            monthly_savings = float(rightsizing.get('estimated_monthly_savings', 0.0) or 0.0)
             total_hourly_savings += hourly_savings
             total_monthly_savings += monthly_savings
 
@@ -917,7 +928,7 @@ async def aws_analyze_ec2_fleet_cost_optimization(
                     'instance_name': inst.get('name'),
                     'current_instance_type': inst.get('type'),
                     'utilization_analysis': utilization,
-                    'recommendation': cheapest,
+                    'rightsizing_recommendation': rightsizing,
                 }
             )
 
@@ -1066,6 +1077,8 @@ async def aws_apply_ec2_rightsizing(
     prefer_downsize_when_idle: bool = True,
     minutes: int = 180,
     period_seconds: int = 300,
+    network_idle_threshold_bytes_per_second: float = 555.0,
+    cpu_peak_cap_percent: float = 50.0,
     ensure_service_continuity: bool = True,
     strict_service_continuity: bool = False,
     service_recovery_timeout_seconds: int = 300,
@@ -1081,37 +1094,17 @@ async def aws_apply_ec2_rightsizing(
             instance_id=instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
+            network_idle_threshold_bytes_per_second=network_idle_threshold_bytes_per_second,
+            cpu_peak_cap_percent=cpu_peak_cap_percent,
         )
 
         current = ec2_manager.get_instance_status(instance_id)
         current_type = current.get('type')
-        current_specs = ec2_manager.get_cheapest_compatible_instance_type(
-            instance_id=instance_id,
-            min_cpu=None,
-            min_ram_gb=None,
-            allowed_families=allowed_families,
-            prefer_downsize_when_idle=False,
-        )
 
-        # If the model auto-fills min constraints equal to current shape, relax them in downsize flows.
-        effective_min_cpu = min_cpu
-        effective_min_ram = min_ram_gb
-        if utilization.get('recommendation') == 'downsize':
-            if (
-                min_cpu is not None
-                and min_ram_gb is not None
-                and int(min_cpu) >= int(current_specs.get('required_cpu', min_cpu))
-                and int(min_ram_gb) >= int(current_specs.get('required_ram_gb', min_ram_gb))
-            ):
-                effective_min_cpu = None
-                effective_min_ram = None
-
-        selection = ec2_manager.get_cheapest_compatible_instance_type(
+        selection = ec2_manager.get_rightsizing_recommendation(
             instance_id=instance_id,
-            min_cpu=effective_min_cpu,
-            min_ram_gb=effective_min_ram,
+            utilization=utilization,
             allowed_families=allowed_families,
-            prefer_downsize_when_idle=(prefer_downsize_when_idle and utilization.get('recommendation') == 'downsize'),
         )
         target_type = selection.get('recommended_instance_type')
         hourly_savings = float(selection.get('estimated_hourly_savings', 0.0) or 0.0)
@@ -1123,7 +1116,7 @@ async def aws_apply_ec2_rightsizing(
                 'message': 'No better compatible target instance type found.',
                 'instance_id': instance_id,
                 'current_instance_type': current_type,
-                'selection': selection,
+                'rightsizing_recommendation': selection,
                 'utilization_analysis': utilization,
             }
 
@@ -1135,7 +1128,7 @@ async def aws_apply_ec2_rightsizing(
                 'instance_id': instance_id,
                 'current_instance_type': current_type,
                 'target_instance_type': target_type,
-                'selection': selection,
+                'rightsizing_recommendation': selection,
                 'utilization_analysis': utilization,
                 'estimated_hourly_savings': hourly_savings,
                 'estimated_monthly_savings': float(selection.get('estimated_monthly_savings', 0.0) or 0.0),
@@ -1156,7 +1149,7 @@ async def aws_apply_ec2_rightsizing(
             'success': True,
             'mode': 'applied',
             'result': result,
-            'selection': selection,
+            'rightsizing_recommendation': selection,
             'utilization_analysis': utilization,
             'estimated_hourly_savings': result.get('estimated_hourly_savings', 0.0),
             'estimated_monthly_savings': result.get('estimated_monthly_savings', 0.0),
@@ -1173,7 +1166,8 @@ async def aws_detect_idle_cost_leaks(
     minutes: int = 180,
     period_seconds: int = 300,
     cpu_idle_threshold_percent: float = 10.0,
-    network_idle_threshold_bytes_per_period: float = 25000.0,
+    network_idle_threshold_bytes_per_second: float = 555.0,
+    cpu_peak_cap_percent: float = 50.0,
     stale_alarm_days: int = 30,
     include_fleet_cost_analysis: bool = True,
     allowed_families: list = None,
@@ -1199,7 +1193,8 @@ async def aws_detect_idle_cost_leaks(
                 minutes=minutes,
                 period_seconds=period_seconds,
                 cpu_idle_threshold_percent=cpu_idle_threshold_percent,
-                network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+                network_idle_threshold_bytes_per_second=network_idle_threshold_bytes_per_second,
+                cpu_peak_cap_percent=cpu_peak_cap_percent,
             )
             utilization_by_instance_id[instance_id] = analysis
             if analysis.get('recommendation') == 'downsize':
@@ -1265,22 +1260,23 @@ async def aws_detect_idle_cost_leaks(
                         minutes=minutes,
                         period_seconds=period_seconds,
                         cpu_idle_threshold_percent=cpu_idle_threshold_percent,
-                        network_idle_threshold_bytes_per_period=network_idle_threshold_bytes_per_period,
+                        network_idle_threshold_bytes_per_second=network_idle_threshold_bytes_per_second,
+                        cpu_peak_cap_percent=cpu_peak_cap_percent,
                     )
 
-                recommendation = ec2_manager.get_cheapest_compatible_instance_type(
+                rightsizing = ec2_manager.get_rightsizing_recommendation(
                     instance_id=instance_id,
+                    utilization=utilization,
                     allowed_families=allowed_families,
-                    prefer_downsize_when_idle=(utilization.get('recommendation') == 'downsize'),
                 )
 
-                hourly_savings = float(recommendation.get('estimated_hourly_savings', 0.0) or 0.0)
-                monthly_savings = float(recommendation.get('estimated_monthly_savings', 0.0) or 0.0)
+                hourly_savings = float(rightsizing.get('estimated_hourly_savings', 0.0) or 0.0)
+                monthly_savings = float(rightsizing.get('estimated_monthly_savings', 0.0) or 0.0)
                 total_hourly_savings += hourly_savings
                 total_monthly_savings += monthly_savings
 
                 current_type = instance.get('type')
-                target_type = recommendation.get('recommended_instance_type')
+                target_type = rightsizing.get('recommended_instance_type')
                 if target_type and target_type != current_type and hourly_savings > 0:
                     actionable_recommendations_count += 1
 
@@ -1305,7 +1301,7 @@ async def aws_detect_idle_cost_leaks(
                         'instance_name': instance.get('name'),
                         'current_instance_type': current_type,
                         'utilization_analysis': utilization,
-                        'recommendation': recommendation,
+                        'rightsizing_recommendation': rightsizing,
                     }
                 )
 
@@ -3072,6 +3068,326 @@ async def aws_delete_security_group(security_group_id: str) -> dict:
             "success": False,
             "error": str(e)
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Launch Template Tools
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def aws_list_launch_templates(name_filter: str = None) -> dict:
+    """
+    List all EC2 launch templates in the region.
+
+    Args:
+        name_filter: Optional substring to filter by launch template name
+    """
+    try:
+        return asg_manager.list_launch_templates(name_filter=name_filter)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_describe_launch_template(
+    launch_template_id: str = None,
+    launch_template_name: str = None,
+    versions: list = None,
+) -> dict:
+    """
+    Get details and version history of a launch template.
+
+    Args:
+        launch_template_id: The launch template ID (lt-xxxxxxxxxxxxxxxxx)
+        launch_template_name: The launch template name (alternative to ID)
+        versions: List of version numbers or aliases to fetch, e.g. ["$Default", "$Latest", "1", "3"].
+                  Defaults to ["$Default", "$Latest"]
+    """
+    try:
+        return asg_manager.describe_launch_template(
+            launch_template_id=launch_template_id,
+            launch_template_name=launch_template_name,
+            versions=versions,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_create_launch_template_version(
+    launch_template_id: str = None,
+    launch_template_name: str = None,
+    source_version: str = "$Default",
+    new_instance_type: str = None,
+    description: str = None,
+    set_as_default: bool = False,
+) -> dict:
+    """
+    Create a new launch template version, inheriting all settings from source_version
+    and optionally overriding the instance type.
+
+    Args:
+        launch_template_id: Launch template ID (provide this or launch_template_name)
+        launch_template_name: Launch template name
+        source_version: Version to base the new version on. Use "$Default", "$Latest", or a version number. Defaults to "$Default"
+        new_instance_type: Override the instance type in the new version (e.g. "t3.small")
+        description: Human-readable description for the new version
+        set_as_default: If true, set the new version as the template's default version
+    """
+    try:
+        return asg_manager.create_launch_template_version(
+            launch_template_id=launch_template_id,
+            launch_template_name=launch_template_name,
+            source_version=source_version,
+            new_instance_type=new_instance_type,
+            description=description,
+            set_as_default=set_as_default,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_set_launch_template_default_version(
+    version: str,
+    launch_template_id: str = None,
+    launch_template_name: str = None,
+) -> dict:
+    """
+    Set the default version of a launch template.
+
+    Args:
+        version: Version number to set as default (e.g. "3" or "$Latest")
+        launch_template_id: Launch template ID
+        launch_template_name: Launch template name (alternative to ID)
+    """
+    try:
+        return asg_manager.set_launch_template_default_version(
+            version=version,
+            launch_template_id=launch_template_id,
+            launch_template_name=launch_template_name,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Auto Scaling Group Tools
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def aws_list_asgs(asg_names: list = None) -> dict:
+    """
+    List Auto Scaling Groups with configuration summary.
+
+    Args:
+        asg_names: Optional list of specific ASG names to retrieve
+    """
+    try:
+        return asg_manager.list_asgs(asg_names=asg_names)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_describe_asg(asg_name: str) -> dict:
+    """
+    Get full details of an Auto Scaling Group including instances, policies, and launch template.
+
+    Args:
+        asg_name: The Auto Scaling Group name
+    """
+    try:
+        return asg_manager.describe_asg(asg_name=asg_name)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_get_instance_asg(instance_id: str) -> dict:
+    """
+    Check whether an EC2 instance belongs to an Auto Scaling Group and return ASG details.
+
+    Args:
+        instance_id: The EC2 instance ID (e.g. i-xxxxxxxxxxxxxxxxx)
+    """
+    try:
+        return asg_manager.get_instance_asg(instance_id=instance_id)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_update_asg_launch_template(
+    asg_name: str,
+    launch_template_id: str = None,
+    launch_template_name: str = None,
+    version: str = "$Latest",
+) -> dict:
+    """
+    Update an Auto Scaling Group to use a specific launch template version.
+    If no launch template id/name is provided, the ASG's current template is kept
+    and only the version pointer is updated.
+
+    Args:
+        asg_name: The Auto Scaling Group name
+        launch_template_id: Override the launch template ID (optional)
+        launch_template_name: Override the launch template name (optional)
+        version: Version to use — a number, "$Latest", or "$Default". Defaults to "$Latest"
+    """
+    try:
+        return asg_manager.update_asg_launch_template(
+            asg_name=asg_name,
+            launch_template_id=launch_template_id,
+            launch_template_name=launch_template_name,
+            version=version,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_sync_asg_launch_template_after_resize(
+    instance_id: str,
+    new_instance_type: str,
+    set_lt_as_default: bool = True,
+) -> dict:
+    """
+    After a vertical resize (EC2 rightsizing), propagate the new instance type to the
+    ASG's launch template so future scale-out events use the updated type.
+
+    Workflow:
+      1. Checks if the instance belongs to an ASG.
+      2. Reads the ASG's current launch template reference.
+      3. Creates a new launch template version with new_instance_type.
+      4. Optionally sets the new version as the LT default.
+      5. Updates the ASG to use $Latest.
+
+    If the instance is not in an ASG, returns success with synced=false.
+
+    Args:
+        instance_id: The EC2 instance that was resized
+        new_instance_type: The instance type it was resized to (e.g. "t3.small")
+        set_lt_as_default: Whether to also set the new LT version as the template default (default: true)
+    """
+    try:
+        return asg_manager.sync_asg_after_resize(
+            instance_id=instance_id,
+            new_instance_type=new_instance_type,
+            set_lt_as_default=set_lt_as_default,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scaling Policy Tools
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def aws_put_asg_scaling_policy(
+    asg_name: str,
+    policy_name: str,
+    policy_type: str = "TargetTrackingScaling",
+    target_value: float = None,
+    predefined_metric_type: str = None,
+    disable_scale_in: bool = False,
+    adjustment_type: str = None,
+    scaling_adjustment: int = None,
+    cooldown: int = None,
+    step_adjustments: list = None,
+    estimated_instance_warmup: int = None,
+    metric_aggregation_type: str = "Average",
+    alarm_name: str = None,
+) -> dict:
+    """
+    Create or update a scaling policy on an Auto Scaling Group.
+
+    policy_type options:
+      - TargetTrackingScaling (default): AWS manages scale-in/out to maintain the target metric.
+          Requires: target_value
+          Optional: predefined_metric_type, disable_scale_in
+      - SimpleScaling: scale by a fixed amount after a CloudWatch alarm fires.
+          Requires: adjustment_type, scaling_adjustment
+          Optional: cooldown, alarm_name
+      - StepScaling: scale in steps based on alarm breach magnitude.
+          Requires: adjustment_type, step_adjustments
+          Optional: estimated_instance_warmup, metric_aggregation_type, alarm_name
+
+    predefined_metric_type values (for TargetTrackingScaling):
+      ASGAverageCPUUtilization | ASGAverageNetworkIn | ASGAverageNetworkOut | ALBRequestCountPerTarget
+
+    adjustment_type values (for Simple/StepScaling):
+      ChangeInCapacity | ExactCapacity | PercentChangeInCapacity
+
+    step_adjustments format:
+      [{"MetricIntervalLowerBound": 0, "MetricIntervalUpperBound": 10, "ScalingAdjustment": 1}, ...]
+      Omit UpperBound on the last step to handle unbounded breaches.
+
+    Args:
+        asg_name: The Auto Scaling Group name
+        policy_name: Unique name for the policy (used to update if it already exists)
+        policy_type: TargetTrackingScaling | SimpleScaling | StepScaling
+        target_value: Target metric value (TargetTracking only)
+        predefined_metric_type: Metric to track (TargetTracking only, default: ASGAverageCPUUtilization)
+        disable_scale_in: Prevent scale-in actions for this policy (TargetTracking only)
+        adjustment_type: How scaling_adjustment is interpreted (Simple/Step only)
+        scaling_adjustment: Number of instances to add/remove (SimpleScaling only)
+        cooldown: Seconds to wait after scaling before allowing another action (SimpleScaling only)
+        step_adjustments: List of step definitions (StepScaling only)
+        estimated_instance_warmup: Seconds for new instances to contribute to metrics (StepScaling only)
+        metric_aggregation_type: Average | Minimum | Maximum (StepScaling only, default: Average)
+        alarm_name: Optional. Name of a pre-existing CloudWatch alarm to attach to this policy.
+            When provided, the policy ARN is added to that alarm's AlarmActions so the alarm
+            triggers this policy. Omit if no alarm attachment is needed right now.
+    """
+    try:
+        return asg_manager.put_scaling_policy(
+            asg_name=asg_name,
+            policy_name=policy_name,
+            policy_type=policy_type,
+            target_value=target_value,
+            predefined_metric_type=predefined_metric_type,
+            disable_scale_in=disable_scale_in,
+            adjustment_type=adjustment_type,
+            scaling_adjustment=scaling_adjustment,
+            cooldown=cooldown,
+            step_adjustments=step_adjustments,
+            estimated_instance_warmup=estimated_instance_warmup,
+            metric_aggregation_type=metric_aggregation_type,
+            alarm_name=alarm_name,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_describe_asg_scaling_policies(asg_name: str) -> dict:
+    """
+    List all scaling policies attached to an Auto Scaling Group.
+
+    Args:
+        asg_name: The Auto Scaling Group name
+    """
+    try:
+        return asg_manager.describe_scaling_policies(asg_name=asg_name)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def aws_delete_asg_scaling_policy(asg_name: str, policy_name: str) -> dict:
+    """
+    Delete a scaling policy from an Auto Scaling Group.
+
+    Args:
+        asg_name: The Auto Scaling Group name
+        policy_name: The name of the policy to delete
+    """
+    try:
+        return asg_manager.delete_scaling_policy(asg_name=asg_name, policy_name=policy_name)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":

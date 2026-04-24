@@ -35,7 +35,7 @@ The worker reads the following runtime variables:
 - COST_OPTIMIZATION_MAX_DATAPOINTS_PER_METRIC (default: 1200)
 - COST_OPTIMIZATION_CPU_IDLE_THRESHOLD_PERCENT (default: 15.0)
 - COST_OPTIMIZATION_CPU_HOT_THRESHOLD_PERCENT (default: 70.0)
-- COST_OPTIMIZATION_NETWORK_IDLE_THRESHOLD_BYTES_PER_PERIOD (default: 150000.0)
+- COST_OPTIMIZATION_NETWORK_IDLE_THRESHOLD_BYTES_PER_SECOND (default: 555.0)
 - COST_OPTIMIZATION_INCLUDE_MEMORY_DISK_SIGNALS (default: true)
 - COST_OPTIMIZATION_MEMORY_PRESSURE_THRESHOLD_PERCENT (default: 75.0)
 - COST_OPTIMIZATION_DISK_PRESSURE_THRESHOLD_PERCENT (default: 80.0)
@@ -187,36 +187,71 @@ Upload the updated env file to the same S3 path and run one manual ECS task befo
 
 ## 10) Update Worker Code (New Release)
 
-When you change worker logic in code, deploy a new container image and point ECS to a new task definition revision.
+When you change worker logic in code, use the deployment script `scripts/deploy_cost_worker.ps1` — it automates all manual steps (build, ECR login, tag, push, optional env upload, task definition re-registration, and optional Scheduler update) in a single command.
 
-Recommended flow:
+### Using the deploy script
 
-1. Update code (for example cost_optimization_worker.py or related modules).
-2. Build a new image with an immutable tag.
-3. Push the image to ECR.
-4. Register a new ECS task definition revision using the new image tag.
-5. Run one manual ECS task to validate behavior.
-6. Update EventBridge Scheduler target to the new task definition revision.
+**Code change only (no env update, no Scheduler update):**
 
-Example commands:
-
-```bash
-# 1) Build image (use your own repository/image naming)
-docker build -t cloudagent-cost-worker:2026-04-18 .
-
-# 2) Tag for ECR
-docker tag cloudagent-cost-worker:2026-04-18 ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/cloudagent-cost-worker:2026-04-18
-
-# 3) Login and push
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
-docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/cloudagent-cost-worker:2026-04-18
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_cost_worker.ps1 `
+  -AccountId YOUR_ACCOUNT_ID `
+  -Region us-east-1 `
+  -TaskDefinitionFamily cost-optimization-worker `
+  -ImageTag v4
 ```
+
+**Code change + upload updated env file to S3:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_cost_worker.ps1 `
+  -AccountId YOUR_ACCOUNT_ID `
+  -Region us-east-1 `
+  -TaskDefinitionFamily cost-optimization-worker `
+  -ImageTag v4 `
+  -UploadEnv `
+  -EnvS3Uri s3://YOUR_BUCKET/ecs/env/cost-optimization.worker.env
+```
+
+**Code change + env upload + update EventBridge Scheduler target to the new revision:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_cost_worker.ps1 `
+  -AccountId YOUR_ACCOUNT_ID `
+  -Region us-east-1 `
+  -TaskDefinitionFamily cost-optimization-worker `
+  -ImageTag v4 `
+  -UploadEnv `
+  -EnvS3Uri s3://YOUR_BUCKET/ecs/env/cost-optimization.worker.env `
+  -UpdateScheduler `
+  -ScheduleName YOUR_SCHEDULE_NAME
+```
+
+### Script parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `-AccountId` | yes | — | AWS account ID |
+| `-Region` | no | `us-east-1` | AWS region |
+| `-TaskDefinitionFamily` | yes | — | ECS task definition family name |
+| `-ImageTag` | no | timestamp | ECR image tag (prefer date or git SHA) |
+| `-UploadEnv` | no | off | Upload env file to S3 before registering task definition |
+| `-EnvFilePath` | no | `config/cost_optimization/cost-optimization.worker.env` | Local env file path |
+| `-EnvS3Uri` | required with `-UploadEnv` | — | S3 destination URI |
+| `-UpdateScheduler` | no | off | Update EventBridge Scheduler target to the new task definition revision |
+| `-ScheduleName` | required with `-UpdateScheduler` | — | EventBridge schedule name |
+| `-ScheduleGroup` | no | `default` | EventBridge schedule group |
+
+### After deployment
+
+1. Run one manual ECS task for validation before relying on the schedule.
+2. Check CloudWatch container logs to confirm the worker started and completed without errors.
 
 Important notes:
 
-- Prefer immutable tags (for example date or git SHA), not latest.
-- EventBridge Scheduler usually points to a specific task definition revision, so after creating a new revision, update the schedule target.
-- Validate first with recommend_only before enabling automatic actions in production.
+- Prefer immutable tags (for example date or git SHA), not `latest`.
+- If you only changed `.env` values and kept the same S3 object key, you can re-run the script with `-UploadEnv` and omit `-ImageTag` to reuse the existing image — but registering a new task definition revision is still required to pick up the updated env file reference if it changed.
+- Validate first with `recommend_only` before enabling automatic actions in production.
 
 ## 11) Update .env Values Stored in S3
 
