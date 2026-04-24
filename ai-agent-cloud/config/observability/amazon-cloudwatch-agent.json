@@ -36,6 +36,12 @@
             "log_group_name": "/ai-agent/system",
             "log_stream_name": "{instance_id}",
             "retention_in_days": 7
+          },
+          {
+            "file_path": "/var/log/mern-app/api.log",
+            "log_group_name": "/mern-app/api",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 7
           }
         ]
       }
@@ -43,9 +49,8 @@
   },
   "metrics": {
     "aggregation_dimensions": [
-      [
-        "InstanceId"
-      ]
+      ["InstanceId"],
+      ["AutoScalingGroupName"]
     ],
     "append_dimensions": {
       "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
