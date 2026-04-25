@@ -10,6 +10,9 @@
 #
 # Optional (features degrade gracefully without them):
 #   SENDGRID_API_KEY, FROM_EMAIL, STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, DEEPAI_API_KEY
+#
+# Optional deployment behavior:
+#   MERN_SKIP_CLIENT_TYPECHECK=true  # Build client with Vite only (skip `tsc &&` in npm run build)
 
 set -euo pipefail
 
@@ -28,6 +31,7 @@ FROM_EMAIL="${FROM_EMAIL:-noreply@example.com}"
 STRIPE_SECRET_KEY="${STRIPE_SECRET_KEY:-}"
 STRIPE_PUBLISHABLE_KEY="${STRIPE_PUBLISHABLE_KEY:-}"
 DEEPAI_API_KEY="${DEEPAI_API_KEY:-}"
+MERN_SKIP_CLIENT_TYPECHECK="${MERN_SKIP_CLIENT_TYPECHECK:-false}"
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║   UniVeranstaltungen MERN Stack - Deployment             ║"
@@ -104,7 +108,12 @@ EOF
 
 cd "$APP_DIR/client"
 npm install --prefer-offline 2>&1 | tail -5
-npm run build
+if [[ "$MERN_SKIP_CLIENT_TYPECHECK" == "true" ]]; then
+  echo "  MERN_SKIP_CLIENT_TYPECHECK=true -> running Vite build without TypeScript type-check"
+  npx vite build
+else
+  npm run build
+fi
 echo "  Frontend build complete → client/dist/"
 
 # Correct ownership after npm runs as ec2-user
