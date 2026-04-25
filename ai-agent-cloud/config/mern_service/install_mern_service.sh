@@ -90,8 +90,6 @@ chmod 600 "$APP_DIR/server/.env"
 echo ""
 echo "[5/9] Building backend..."
 cd "$APP_DIR/server"
-npm install --omit=dev --prefer-offline 2>&1 | tail -5
-# Install devDependencies too (needed for tsc)
 npm install --prefer-offline 2>&1 | tail -5
 npm run build
 echo "  Backend build complete → server/dist/"
