@@ -13,6 +13,7 @@
 #
 # Optional deployment behavior:
 #   MERN_SKIP_CLIENT_TYPECHECK=true  # Build client with Vite only (skip `tsc &&` in npm run build)
+#   NGINX_PORT=80                    # Public nginx port for MERN app
 
 set -euo pipefail
 
@@ -32,6 +33,12 @@ STRIPE_SECRET_KEY="${STRIPE_SECRET_KEY:-}"
 STRIPE_PUBLISHABLE_KEY="${STRIPE_PUBLISHABLE_KEY:-}"
 DEEPAI_API_KEY="${DEEPAI_API_KEY:-}"
 MERN_SKIP_CLIENT_TYPECHECK="${MERN_SKIP_CLIENT_TYPECHECK:-false}"
+NGINX_PORT="${NGINX_PORT:-80}"
+
+FRONTEND_URL="http://$MERN_APP_HOST"
+if [[ "$NGINX_PORT" != "80" ]]; then
+  FRONTEND_URL="${FRONTEND_URL}:$NGINX_PORT"
+fi
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║   UniVeranstaltungen MERN Stack - Deployment             ║"
@@ -39,6 +46,7 @@ echo "╚═══════════════════════�
 echo "Host:     $MERN_APP_HOST"
 echo "App dir:  $APP_DIR"
 echo "Backend:  port $BACKEND_PORT"
+echo "Nginx app port: $NGINX_PORT"
 
 # ── Step 1: OS dependencies ───────────────────────────────────────────────────
 echo ""
@@ -81,7 +89,7 @@ PORT=$BACKEND_PORT
 MONGO_URI=$MONGO_URI
 MONGO_DB=$MONGO_DB
 JWT_SECRET=$JWT_SECRET
-FRONTEND_URL=http://$MERN_APP_HOST
+FRONTEND_URL=$FRONTEND_URL
 SENDGRID_API_KEY=$SENDGRID_API_KEY
 FROM_EMAIL=$FROM_EMAIL
 STRIPE_SECRET_KEY=$STRIPE_SECRET_KEY
@@ -152,8 +160,9 @@ sudo rm -f /etc/nginx/conf.d/default.conf
 
 cat <<EOF | sudo tee /etc/nginx/conf.d/mern-app.conf >/dev/null
 server {
-    listen 80;
-    server_name _;
+  listen ${NGINX_PORT};
+  listen [::]:${NGINX_PORT};
+    server_name ${MERN_APP_HOST};
 
     root $APP_DIR/client/dist;
     index index.html;
@@ -195,8 +204,8 @@ echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo " Deployment complete!"
 echo ""
-echo " Frontend:  http://$MERN_APP_HOST"
-echo " API:       http://$MERN_APP_HOST/api"
+echo " Frontend:  $FRONTEND_URL"
+echo " API:       $FRONTEND_URL/api"
 echo " Logs:      $LOG_DIR/api.log"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
