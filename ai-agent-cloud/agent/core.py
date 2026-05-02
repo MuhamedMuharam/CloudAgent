@@ -13,9 +13,11 @@ This module orchestrates the entire agent workflow:
 import asyncio  # For async MCP communication
 import json
 import os
+import re
 import sys
 import time
-from typing import Dict, List, Set
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv  # Load .env file with credentials
 from openai import OpenAI, RateLimitError  # GPT-4 for planning and reasoning
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
@@ -69,8 +71,52 @@ BASE_SYSTEM_PROMPT = (
     "- You may also use MCP observability tools directly for targeted checks\n"
     "- When calling delegate_observability_analysis, craft analysis_request as a focused telemetry task for the current step; avoid copying the full user goal unless directly relevant\n"
     "- Report exactly what you changed/found\n"
-     "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
+    "- Only execute mutating actions (resize/stop/delete/apply) when execution intent is present in the goal — "
+    "phrases like 'do it', 'now', 'execute', 'apply', 'go ahead', 'make it happen', 'resize to', 'change to' all count; "
+    "when intent is present, execute without asking for confirmation\n"
 )
+
+
+MUTATING_TOOLS: frozenset = frozenset({
+    # EC2 lifecycle
+    "aws_create_ec2_instance",
+    "aws_start_ec2_instance",
+    "aws_stop_ec2_instance",
+    "aws_reboot_ec2_instance",
+    "aws_delete_ec2_instance",
+    # Rightsizing
+    "aws_resize_ec2_instance",
+    "aws_apply_ec2_rightsizing",
+    # ASG / Launch Template
+    "aws_sync_asg_launch_template_after_resize",
+    "aws_update_asg_launch_template",
+    "aws_create_launch_template_version",
+    "aws_set_launch_template_default_version",
+    "aws_put_asg_scaling_policy",
+    "aws_delete_asg_scaling_policy",
+    # SSM execution (remote commands)
+    "aws_ssm_run_command",
+    "aws_ssm_restart_service",
+    "aws_ssm_safe_disk_cleanup",
+    # CloudWatch mutations
+    "aws_create_cloudwatch_alarm",
+    "aws_delete_cloudwatch_alarm",
+    "aws_create_cloudwatch_dashboard",
+    # Security group mutations
+    "aws_edit_security_group_rule",
+    "aws_create_security_group_rule",
+    "aws_delete_security_group_rule",
+    # Networking
+    "aws_create_vpc",
+    "aws_delete_vpc",
+    "aws_create_subnet",
+    "aws_create_internet_gateway",
+    "aws_attach_internet_gateway",
+    "aws_create_nat_gateway",
+    "aws_create_route_table",
+    "aws_create_route",
+    "aws_associate_route_table",
+})
 
 
 INSTRUCTION_PACKS = {
@@ -126,15 +172,17 @@ INSTRUCTION_PACKS = {
         "- For generic trace requests with no service specified, set exclude_loopback_only=true to avoid localhost-only noise\n"
         "- Do not assume traces can be filtered by EC2 instance ID directly; X-Ray filtering is service/trace based\n"
         "- If summaries indicate loopback-only or mostly zero-duration traces, call aws_get_xray_service_graph and/or aws_get_xray_trace_details before concluding\n"
-        "- During mitigation analysis, cross-check X-Ray findings with log groups /ai-agent/app, /ai-agent/worker, and /ai-agent/otel\n"
+        "- During mitigation analysis, cross-check X-Ray findings with log groups /ai-agent/agent and /mern-app/api\n"
         "- In final answers, summarize analysis fields first (fault/error/throttle counts, top services, warnings) before listing raw trace IDs\n"
     ),
     "cost_optimization": (
         "COST OPTIMIZATION MODE:\n"
         "- If no explicit execution intent is present, provide recommendations, rationale, and projected savings only\n"
-        "- Only execute mutating optimization actions (resize/stop/delete/apply) when user explicitly asks to take actions\n"
+        "- Execute mutating actions (resize/stop/delete/apply) when execution intent is clear — "
+        "'do it', 'now', 'resize to', 'change to', 'apply', 'go ahead', 'execute', 'make it happen' all qualify\n"
         "- For long lookback windows, ensure period_seconds keeps per-metric datapoints manageable (prefer <=300 datapoints)\n"
-        "- In execution mode, run aws_resize_ec2_instance with dry_run=true first to validate compatibility and target choice\n"
+        "- In execution mode, run aws_resize_ec2_instance with dry_run=true first to validate compatibility; "
+        "if compatible=true, immediately call it again with dry_run=false — do NOT stop to ask for confirmation\n"
         "- Apply with aws_apply_ec2_rightsizing only when compatibility is true and estimated_hourly_savings is positive\n"
         "- For resize actions, require compatibility checks and backup plan before changes\n"
         "- When calling aws_apply_ec2_rightsizing, do not set min_cpu/min_ram_gb unless the user explicitly asked for hard minimum capacity\n"
@@ -267,7 +315,7 @@ def build_system_prompt(goal: str) -> str:
     if any(k in goal_text for k in ["xray", "trace", "tracing", "latency", "fault", "error rate"]):
         parts.append(INSTRUCTION_PACKS["xray_tracing"])
 
-    if any(k in goal_text for k in ["cost", "optimiz", "rightsiz", "saving", "cheapest", "compute optimizer"]):
+    if any(k in goal_text for k in ["cost", "optimiz", "rightsiz", "resize", "saving", "cheapest", "compute optimizer"]):
         parts.append(INSTRUCTION_PACKS["cost_optimization"])
 
     if any(k in goal_text for k in ["asg", "auto scal", "autoscal", "launch template", "scaling policy", "scale out", "scale in"]):
@@ -419,7 +467,10 @@ async def run_agent(goal: str, mcp_servers: list = None):
             }
         ]
     
+    run_started_at: datetime = datetime.now(timezone.utc)
+    last_mutating_action_at: Optional[datetime] = None
     actions_taken = []
+    resolved_instances: Dict[str, str] = {}  # instance_name (lowercase) → instance_id
     execution_result = {
         "success": False,
         "goal": goal,
@@ -650,7 +701,18 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 })
                                 continue
 
+                            # Inject resolved instance_id into the request so the helper
+                            # doesn't waste an iteration calling aws_list_ec2_instances.
+                            if resolved_instances and "instance_id=i-" not in helper_request:
+                                def _inject_id(m: re.Match) -> str:
+                                    inst_id = resolved_instances.get(m.group(1).strip().lower(), "")
+                                    if inst_id:
+                                        return f"instance_name={m.group(1)}; instance_id={inst_id}"
+                                    return m.group(0)
+                                helper_request = re.sub(r"instance_name=([^;,\s]+)", _inject_id, helper_request)
+
                             print(f"🛰️ Delegating to observability helper (model: {helper_model})")
+                            print(f"🛰️ Helper analysis_request: {helper_request}")
                             helper_result = await run_observability_helper(
                                 goal=goal,
                                 client=client,
@@ -687,10 +749,11 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 error=None if helper_success else str(helper_result.get("reason")),
                             )
 
-                            actions_taken.append(
-                                "observability_helper(tool=delegate_observability_analysis,"
-                                f"model={helper_result.get('model')},success={helper_success})"
-                            )
+                            # Count each helper tool call individually in the trajectory.
+                            # The delegate call itself is not a cloud operation — only the
+                            # tools the helper actually invoked are real work steps.
+                            for _helper_tool in helper_tools_used:
+                                actions_taken.append(f"[helper]{_helper_tool}")
 
                             delegated_result = {
                                 "success": helper_success,
@@ -831,10 +894,20 @@ async def run_agent(goal: str, mcp_servers: list = None):
                         try:
                             result_obj = json.loads(result)
                             print(json.dumps(result_obj, indent=3))
-                            
+
+                            # Cache instance name→id mappings for helper injection
+                            if tool_name == "aws_list_ec2_instances" and result_obj.get("success"):
+                                for _inst in result_obj.get("instances", []):
+                                    _iname = (_inst.get("name") or "").strip()
+                                    _iid = (_inst.get("id") or "").strip()
+                                    if _iname and _iid:
+                                        resolved_instances[_iname.lower()] = _iid
+
                             # Log action to state manager
                             if result_obj.get("success"):
                                 actions_taken.append(f"{tool_name}({json.dumps(args)})")
+                                if tool_name in MUTATING_TOOLS:
+                                    last_mutating_action_at = datetime.now(timezone.utc)
 
                                 # Track cost-optimization recommendation/action KPIs when tool returns savings metadata.
                                 estimated_hourly_savings = float(result_obj.get('estimated_hourly_savings', 0.0) or 0.0)
@@ -912,6 +985,11 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     actions_taken=actions_taken
                 )
 
+                run_completed_at = datetime.now(timezone.utc)
+                ttm_seconds = (
+                    (last_mutating_action_at - run_started_at).total_seconds()
+                    if last_mutating_action_at else None
+                )
                 execution_result = {
                     "success": True,
                     "goal": goal,
@@ -919,6 +997,11 @@ async def run_agent(goal: str, mcp_servers: list = None):
                     "reason": "completed",
                     "actions_taken": actions_taken,
                     "iterations": iteration,
+                    "run_started_at": run_started_at.isoformat(),
+                    "run_completed_at": run_completed_at.isoformat(),
+                    "ttm_seconds": ttm_seconds,
+                    "task_completion_time_seconds": (run_completed_at - run_started_at).total_seconds(),
+                    "trajectory_length": len(actions_taken),
                 }
                 
                 # Show statistics
@@ -940,6 +1023,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 outcome=timeout_outcome,
                 actions_taken=actions_taken + ["max_iterations_reached"],
             )
+            timeout_completed_at = datetime.now(timezone.utc)
             execution_result = {
                 "success": False,
                 "goal": goal,
@@ -948,6 +1032,11 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 "actions_taken": actions_taken,
                 "iterations": iteration,
                 "max_iterations": max_iterations,
+                "run_started_at": run_started_at.isoformat(),
+                "run_completed_at": timeout_completed_at.isoformat(),
+                "ttm_seconds": None,
+                "task_completion_time_seconds": (timeout_completed_at - run_started_at).total_seconds(),
+                "trajectory_length": len(actions_taken),
             }
     
     finally:

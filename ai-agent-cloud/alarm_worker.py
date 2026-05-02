@@ -6,6 +6,7 @@ triggers the AI agent automatically for ALARM events.
 """
 
 import os
+import re
 import time
 import logging
 import json
@@ -105,7 +106,46 @@ def _classify_alarm(alarm_name: str, payload: dict) -> str:
         return "memory_pressure"
     if "cpuutilization" in metric_name or "cpu" in name:
         return "cpu_pressure"
+    if (
+        "mernerrorcount" in metric_name
+        or "mernservicedown" in metric_name
+        or "applicationerror" in name
+        or "mern" in name
+        or ("error" in name and "count" in name)
+        or ("service" in name and "down" in name)
+    ):
+        return "application_error"
     return "generic_alarm"
+
+
+def _extract_triggering_child_alarm(reason: str, payload: dict) -> str:
+    """
+    Return the name of the child alarm that triggered a composite alarm.
+    Prefers structured TriggeringChildren from payload; falls back to parsing reason text.
+    Returns empty string for simple (non-composite) alarms.
+    """
+    if isinstance(payload, dict):
+        children = payload.get("TriggeringChildren", [])
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, str) and child:
+                    return child
+                if isinstance(child, dict):
+                    name = child.get("AlarmName") or child.get("Arn", "")
+                    if name:
+                        return str(name)
+
+    if reason:
+        # "The alarm name is [MERN-ServiceDown-Alarm]" or "alarm name is MERN-ServiceDown-Alarm"
+        match = re.search(r"alarm name is \[?([^\]\s,;]+)\]?", reason, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        # "MERN-ServiceDown-Alarm transitioned to ALARM"
+        match = re.search(r"([A-Za-z0-9_\-]+(?:ServiceDown|ErrorCount|Alarm)[A-Za-z0-9_\-]*)\s+transitioned", reason, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return ""
 
 
 def _build_helper_analysis_request(
@@ -113,6 +153,7 @@ def _build_helper_analysis_request(
     instance_id: str,
     fallback_instance_name: str,
     metric_name: str,
+    triggering_child: str = "",
 ) -> str:
     target = f"instance_id={instance_id}" if instance_id else f"instance_name={fallback_instance_name}"
     metric_hint = metric_name or "unknown"
@@ -130,9 +171,33 @@ def _build_helper_analysis_request(
             "to identify top large files/paths and inode pressure; traces only if logs indicate request-path errors"
         )
     elif alarm_family == "memory_pressure":
-        scope = "scope=memory metrics and app/worker logs; traces only if logs indicate latency/error propagation"
+        scope = "scope=memory metrics and app/agent logs; traces only if logs indicate latency/error propagation"
     elif alarm_family == "cpu_pressure":
-        scope = "scope=cpu metrics first, then correlated app/worker logs; xray traces only for targeted confirmation"
+        scope = "scope=cpu metrics first, then correlated app/agent logs; xray traces only for targeted confirmation"
+    elif alarm_family == "application_error":
+        child_lower = triggering_child.lower()
+        if triggering_child and ("servicedown" in child_lower or ("service" in child_lower and "down" in child_lower)):
+            scope = (
+                "scope=service outage (triggering_child=" + triggering_child + "): "
+                "skip log scanning entirely; "
+                "verify mern-api.service and nginx.service status via SSM immediately; "
+                "if either service is inactive/failed, restart it if restart is allowed; "
+                "do not waste calls checking /mern-app/api logs before confirming service state"
+            )
+        elif triggering_child and ("errorcount" in child_lower or ("error" in child_lower and "count" in child_lower)):
+            scope = (
+                "scope=application error logs (triggering_child=" + triggering_child + "): "
+                "check /mern-app/api for recent error patterns "
+                "(exceptions, MongoError, ECONNREFUSED, UnhandledPromiseRejection, crashed); "
+                "then verify mern-api.service and nginx.service are active via SSM"
+            )
+        else:
+            scope = (
+                "scope=application logs first: check /mern-app/api for error patterns "
+                "(exceptions, MongoError, ECONNREFUSED, UnhandledPromiseRejection, crashed), "
+                "then verify mern-api.service and nginx.service are active via SSM; "
+                "identify whether the trigger was a log error or a service outage"
+            )
     else:
         scope = "scope=balanced diagnostics across metrics, logs, traces"
 
@@ -142,6 +207,19 @@ def _build_helper_analysis_request(
         + scope
         + ". The agent may append additional context, hypotheses, and focused checks as needed."
     )
+
+
+def _parse_state_change_time(raw: str) -> datetime | None:
+    """Parse CloudWatch StateChangeTime string into an aware datetime."""
+    if not raw:
+        return None
+    try:
+        normalized = str(raw).strip().replace("+0000", "+00:00")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return None
 
 
 def _parse_bool_env(var_name: str, default: bool) -> bool:
@@ -189,6 +267,7 @@ def _build_goal(
     alarm_family = _classify_alarm(alarm_name, payload)
 
     instance_id = _extract_instance_id(payload)
+    triggering_child = _extract_triggering_child_alarm(reason, payload)
     target_phrase = f"instance_id {instance_id}" if instance_id else f"instance named {fallback_instance_name}"
     dimensions_summary = ", ".join(f"{d['name']}={d['value']}" for d in dimensions[:10]) or "<none>"
     allowed_service_list = ", ".join(restart_services) if restart_services else "<none>"
@@ -198,21 +277,56 @@ def _build_goal(
         instance_id=instance_id,
         fallback_instance_name=fallback_instance_name,
         metric_name=metric_name,
+        triggering_child=triggering_child,
+    )
+
+    child_context = f"Triggering child alarm: {triggering_child}. " if triggering_child else ""
+
+    child_lower = triggering_child.lower()
+    is_service_outage = alarm_family == "application_error" and (
+        "servicedown" in child_lower or ("service" in child_lower and "down" in child_lower)
+    )
+
+    if is_service_outage:
+        pre_delegate_guidance = (
+            "IMPORTANT: This is a service-outage alarm. "
+            "Do NOT call delegate_observability_analysis — it is unnecessary here. "
+            "Act directly: resolve the instance_id if needed (aws_list_ec2_instances), "
+            "then call aws_ssm_get_service_status for mern-api.service and nginx.service, "
+            "restart any inactive service using aws_ssm_restart_service if it is in the allowed list, "
+            "verify the service is active after restart, and report findings. "
+        )
+    elif alarm_family == "application_error":
+        pre_delegate_guidance = (
+            "Call delegate_observability_analysis before collecting metrics or health snapshots. "
+            "Do NOT call aws_collect_ec2_health_snapshot before the helper. "
+        )
+    else:
+        pre_delegate_guidance = ""
+
+    delegate_instruction = (
+        ""
+        if is_service_outage
+        else (
+            "Before deciding mitigation, call delegate_observability_analysis once. "
+            f"Start helper analysis_request from this base seed and extend it as needed: {helper_analysis_request_base}. "
+            "Keep the base fields target, time_window, metric_hint, and scope, then add any extra context you need. "
+            "Use the helper structured JSON report as primary evidence. "
+        )
     )
 
     return (
         "An alarm notification was already received from SQS by the worker. "
         "Use this provided alarm context directly for triage and mitigation. "
         "Do not call aws_poll_alarm_notifications again unless required context is missing. "
-        "Before deciding mitigation, call delegate_observability_analysis once. "
-        f"Start helper analysis_request from this base seed and extend it as needed: {helper_analysis_request_base}. "
-        "Keep the base fields target, time_window, metric_hint, and scope, then add any extra context you need. "
-        "Use the helper structured JSON report as primary evidence. "
+        f"{pre_delegate_guidance}"
+        f"{delegate_instruction}"
         f"Triage this ALARM for {target_phrase}. "
         f"Alarm context: name={alarm_name}, state={new_state}, family_hint={alarm_family}, metric_hint={metric_name or '<unknown>'}. "
         f"Dimensions: {dimensions_summary}. "
         f"Reason: {reason}. "
-        "you can Use generic mitigation tools when needed (not alarm-specific): "
+        f"{child_context}"
+        "You can use generic mitigation tools when needed (not alarm-specific): "
         "aws_collect_ec2_health_snapshot, aws_get_ec2_instance_status, aws_get_ec2_instance_ssm_status, "
         "aws_get_ec2_metrics, aws_list_ec2_alarms, aws_ssm_collect_host_diagnostics, aws_ssm_safe_disk_cleanup, "
         "aws_ssm_get_service_status, aws_ssm_restart_service, aws_reboot_ec2_instance. "
@@ -326,6 +440,16 @@ def run_alarm_worker() -> None:
                         logger.exception(json.dumps({"event": "ack_failed", "reason": "non_alarm_ack"}, ensure_ascii=True))
                 continue
 
+            processing_start = datetime.now(timezone.utc)
+            state_change_time = _parse_state_change_time(alarm.get("state_changed_at"))
+            # notification_delay: SQS queue dwell time (alarm fired → worker picked it up).
+            # In production this is ~10-30s; high values mean the worker was offline.
+            # Clamped to 0 — negative values are sub-second clock skew between local clock and AWS.
+            notification_delay_seconds = (
+                max(0.0, (processing_start - state_change_time).total_seconds())
+                if state_change_time else None
+            )
+
             goal = _build_goal(
                 notification=notification,
                 fallback_instance_name=fallback_instance_name,
@@ -348,6 +472,8 @@ def run_alarm_worker() -> None:
                     state=state,
                     attempt=attempt,
                     action="run_agent_sync",
+                    notification_delay_seconds=round(notification_delay_seconds, 1) if notification_delay_seconds is not None else None,
+                    auto_mitigate=auto_mitigate,
                 )
 
                 try:
@@ -382,6 +508,22 @@ def run_alarm_worker() -> None:
                         error=str(exc),
                     )
 
+            ttm_seconds = (
+                last_agent_result.get("ttm_seconds")
+                if isinstance(last_agent_result, dict) else None
+            )
+            trajectory_length = (
+                last_agent_result.get("trajectory_length")
+                if isinstance(last_agent_result, dict) else None
+            )
+            # e2e: total clock time from alarm firing to last mutating action.
+            # e2e = notification_delay + ttm (agent diagnosis + remediation time).
+            e2e_seconds = (
+                round(notification_delay_seconds + ttm_seconds, 1)
+                if notification_delay_seconds is not None and ttm_seconds is not None
+                else None
+            )
+
             should_acknowledge = bool(receipt_handle) and (agent_success or not require_success_for_ack)
             if should_acknowledge:
                 try:
@@ -395,6 +537,10 @@ def run_alarm_worker() -> None:
                         action="acknowledged",
                         agent_success=agent_success,
                         require_success_for_ack=require_success_for_ack,
+                        notification_delay_seconds=round(notification_delay_seconds, 1) if notification_delay_seconds is not None else None,
+                        ttm_seconds=round(ttm_seconds, 1) if ttm_seconds is not None else None,
+                        e2e_seconds=e2e_seconds,
+                        trajectory_length=trajectory_length,
                     )
                 except Exception:
                     logger.exception(json.dumps({"event": "ack_failed", "reason": "post_agent"}, ensure_ascii=True))

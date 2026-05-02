@@ -62,51 +62,36 @@ if __name__ == "__main__":
     # DEFINE YOUR GOAL HERE
     # ========================================
     # This is what you want the AI agent to accomplish
-    # The agent will use GPT-4 to reason about how to achieve this goal
     # It will then call MCP tools (via AWS server) to take actions
-    
-   #  goal = """
-   #  Create a production VPC infrastructure:
-    
-   #  1. Create a VPC with CIDR 10.0.0.0/16 named 'test2-vpc'
-   #  2. Create 2 public subnets:
-   #     - Public subnet 1: 10.0.1.0/24 in us-east-1a , name it 'test2-public-subnet-1'
-   #     - Public subnet 2: 10.0.2.0/24 in us-east-1b, name it 'test2-public-subnet-2'
-   #  3. Create 2 private subnets:
-   #     - Private subnet 1: 10.0.10.0/24 in us-east-1a , name it 'test2-private-subnet-1'
-   #     - Private subnet 2: 10.0.11.0/24 in us-east-1b , name it 'test2-private-subnet-2'
-   #  4. Create an Internet Gateway and attach it to the VPC , name it 'test2-igw'
-   #  5. Create a NAT Gateway in the first public subnet , name it 'test2-nat-gateway'
-   #  6. Create route tables:
-   #     - Public route table with route to Internet Gateway (0.0.0.0/0 -> IGW)
-   #     - Private route table with route to NAT Gateway (0.0.0.0/0 -> NAT)
-   #  7. Associate route tables with appropriate subnets
-   #  """
+ 
     goal = """
-    Analyze last 15 minutes traces for real-api and worker task failures, identify root cause from trace details and logs, then provide concrete mitigation steps with priority.
+    resize now the instance named ASG-instance to be t3.medium instead of t3.micro.
 """
     # You can also test other goals:
-    #summarize to me the xray map in the last 20 min and check if there is any anomalies for the instance named TestWebServer with id = "i-025c8c399d6f776c4".     """
+    # detect idle cost leaks in my AWS account and recommend actions to fix them.
+    # Analyze and apply rightsizing action(if needed) for instance named SrcInstance and recommend savings.
+    # look if there is any policy violation in the security group named Testing1 and fix them by yourself
+    #summarize to me the xray map in the last 20 min and check if there is any anomalies for the instance named TestWebServer """
 
     #summarize to me the diskio section of the metrics last hour for the instance named TestWebServer.
     # Investigate instance named TestWebServer. Check alarms, metrics, and logs. Give me the current state , Identify root cause (if there is a problem) and propose immediate mitigation.
     
     print("🚀 Starting AI Agent with MCP...\n")
     print(f"📝 Goal: {goal}\n")
-    
-    # ========================================
-    # RUN THE AGENT
-    # ========================================
-    # This calls agent/core.py → run_agent_sync()
-    # Which internally:
-    # 1. Loads envirmeonment variables (.env)
-    # 2. Spawns MCP servers (AWS, Azure, GCP)
-    # 3. Discovers tools from servers
-    # 4. Runs GPT-4 in a loop to accomplish goal
-    # 5. Logs all actions to state/
-    run_agent_sync(goal)
-    
+
+    result = run_agent_sync(goal)
+
     print("\n✨ Agent execution completed!")
+
+    if isinstance(result, dict):
+        print("\n📏 Evaluation Metrics:")
+        print(f"   Trajectory Length (TL)  : {result.get('trajectory_length', 'N/A')} tool call(s)")
+        e2e = result.get("task_completion_time_seconds")
+        if e2e is not None:
+            print(f"   End-to-End Time (E2E)   : {e2e:.1f}s  ({e2e / 60:.1f} min)")
+        success = result.get("success", False)
+        print(f"   Task Success (TSR)      : {'SUCCESS' if success else 'FAILED'} ({result.get('reason', 'N/A')})")
+
     print("\n💡 Next steps:")
     print("   - View state: python view_state.py")
     print("   - View logs: python view_state.py --log")

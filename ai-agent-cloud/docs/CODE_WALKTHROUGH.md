@@ -25,8 +25,7 @@ High-level modules and responsibilities:
 3. `mcp_servers/`: MCP server implementations (AWS fully implemented).
 4. `cloud_providers/aws/`: AWS manager classes wrapping boto3 APIs.
 5. `alarm_worker.py`: Event-driven worker that polls SQS alarm notifications and triggers agent triage.
-6. `config/real_service/`: Deployable FastAPI + Celery + Redis + OTEL workload.
-7. `config/observability/`: CloudWatch agent config and legacy demo service artifacts.
+6. `config/observability/`: CloudWatch agent config for log and metric collection.
 8. `state/`: Persistent snapshot (`state.json`) and append-only action log (`audit_log.jsonl`).
 9. `policies/`: YAML policy constraints enforced before tool execution.
 10. `docs/`: Operational and architecture documentation.
@@ -200,63 +199,21 @@ Utilities:
 1. `sync_aws_state.py`: pull live AWS resources and rewrite state snapshot.
 2. `view_state.py`: report statistics/logs and optional sync.
 
-## 10. Real Service Workload (Phases 5/6)
-
-The workload under `config/real_service/src/` provides realistic async processing and telemetry.
-
-### Runtime components
-
-1. API service (`api.py`, systemd unit: `real-api.service`)
-2. Worker service (`tasks.py`, `celery_app.py`, systemd unit: `real-worker.service`)
-3. Redis broker/backend (`redis6.service`)
-4. OTEL collector (`otel-collector.service`)
-
-### Current API endpoints
-
-1. `GET /health`
-2. `POST /orders`
-3. `GET /orders`
-4. `GET /orders/stats`
-5. `GET /orders/{order_id}`
-6. `POST /orders/{order_id}/cancel`
-7. `GET /tasks/{task_id}`
-
-### Order/task persistence behavior
-
-1. On `POST /orders`, API enqueues Celery task and indexes order metadata in Redis.
-2. Redis keys maintain:
-   - order index list
-   - order payload by `order_id`
-   - task-to-order mapping
-3. `GET /tasks/{task_id}` returns 404 for unknown task IDs that remain in PENDING and are not in the app index.
-
-### Processing simulation behavior
-
-In `tasks.py`, processing time is intentionally long for testing:
-
-1. `ORDER_PROCESSING_SECONDS_PER_ITEM` default: 180 seconds.
-2. `ORDER_PROCESSING_MAX_SECONDS` default: 7200 seconds.
-3. Effective duration scales with item count and is capped.
-
-## 11. Observability and Log-Group Semantics
+## 10. Observability and Log-Group Semantics
 
 Current CloudWatch log mapping (from `config/observability/amazon-cloudwatch-agent.json`):
 
-1. `/var/log/ai-agent/app.log` -> `/ai-agent/app`
-2. `/var/log/ai-agent/agent.log` -> `/ai-agent/agent`
-3. `/var/log/ai-agent/worker.log` -> `/ai-agent/worker`
-4. `/var/log/ai-agent/otel-collector.log` -> `/ai-agent/otel`
-5. `/var/log/messages` -> `/ai-agent/system`
+1. `/var/log/ai-agent/agent.log` -> `/ai-agent/agent`
+2. `/var/log/messages` -> `/ai-agent/system`
+3. `/var/log/mern-app/api.log` -> `/mern-app/api`
 
 Operational interpretation:
 
-1. `/ai-agent/app`: FastAPI request/validation/order submission issues.
-2. `/ai-agent/worker`: Celery execution, retries, failures, latency.
-3. `/ai-agent/otel`: telemetry pipeline/export issues.
-4. `/ai-agent/system`: host, systemd, OS-level events.
-5. `/ai-agent/agent`: alarm worker and orchestration logs.
+1. `/ai-agent/agent`: alarm_worker polling, agent orchestration, and decision logs.
+2. `/ai-agent/system`: host, systemd, OS-level events.
+3. `/mern-app/api`: MERN application request and error logs (Express, MongoDB, Node.js).
 
-`agent/core.py` instruction packs now include this log-group routing guidance for incident triage.
+`agent/core.py` and `agent/observability_helper.py` instruction packs include this log-group routing guidance for incident triage.
 
 ## 12. Deployment and Runtime Path Reality
 
@@ -294,16 +251,6 @@ This is captured in `docs/FastApiServiceGuide.md` under update workflow.
 6. `ALARM_WORKER_VISIBILITY_TIMEOUT`
 7. `ALARM_WORKER_LOOP_SLEEP_SECONDS`
 8. `ALARM_WORKER_PROCESS_ONLY_ALARM`
-
-### Real service and telemetry
-
-1. `CELERY_BROKER_URL`
-2. `CELERY_RESULT_BACKEND`
-3. `OTEL_SERVICE_NAME`
-4. `OTEL_EXPORTER_OTLP_ENDPOINT`
-5. `APP_ENV`
-6. `ORDER_PROCESSING_SECONDS_PER_ITEM`
-7. `ORDER_PROCESSING_MAX_SECONDS`
 
 ## 14. What Changed Compared to Older Walkthrough Versions
 

@@ -155,6 +155,9 @@ ssm:
     - '\\b(?:apt|apt-get)\\b.*\\b(?:dist-upgrade|full-upgrade)\\b'
     - '\\bcurl\\b.*\\|\\s*(?:bash|sh)\\b'
     - '\\bwget\\b.*\\|\\s*(?:bash|sh)\\b'
+    - '\\bkill\\b'
+    - '\\bpkill\\b'
+    - '\\bkillall\\b'
 
 # NAT Gateway Policies
 nat_gateway:

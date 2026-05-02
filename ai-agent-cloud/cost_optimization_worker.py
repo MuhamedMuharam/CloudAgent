@@ -393,8 +393,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
         skipped_reasons_summary: Dict[str, List[str]] = {}
         for item in skipped_candidates:
             label = item.get("instance_name") or item.get("instance_id") or "unknown"
-            for r in item.get("skip_reasons", []):
-                skipped_reasons_summary.setdefault(r, []).append(label)
+            skipped_reasons_summary[label] = item.get("skip_reasons", [])
 
         cycle_result = {
             "success": True,
@@ -403,6 +402,10 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
             "summary": {
                 "instance_count": len(instances),
                 "candidate_count": len(selected_candidates),
+                "candidate_names": [
+                    c.get("instance_name") or c.get("instance_id") or "unknown"
+                    for c in selected_candidates
+                ],
                 "skipped_count": len(skipped_candidates),
                 "skipped_reasons_summary": skipped_reasons_summary,
                 "estimated_hourly_savings": total_hourly_savings,
@@ -658,9 +661,17 @@ def run_cost_optimization_worker() -> int:
     try:
         cycle_result = asyncio.run(_run_cost_optimization_cycle(config=config, logger=logger))
 
+        completed_at = datetime.now(timezone.utc)
         cycle_result["status"] = "completed" if cycle_result.get("success") else "failed"
         cycle_result["started_at"] = started_at.isoformat()
-        cycle_result["completed_at"] = datetime.now(timezone.utc).isoformat()
+        cycle_result["completed_at"] = completed_at.isoformat()
+        actions_applied = len(cycle_result.get("applied_actions", []))
+        ttm_seconds = (
+            (completed_at - started_at).total_seconds()
+            if config["mode"] == "take_action" and actions_applied > 0
+            else None
+        )
+        cycle_result["ttm_seconds"] = round(ttm_seconds, 1) if ttm_seconds is not None else None
 
         state_manager.log_action(
             action_type="cost_optimization_service_run",
@@ -722,7 +733,8 @@ def run_cost_optimization_worker() -> int:
                 "cost_optimization_worker_completed",
                 mode=config["mode"],
                 summary=summary,
-                applied_actions=len(cycle_result.get("applied_actions", [])),
+                applied_actions=actions_applied,
+                ttm_seconds=cycle_result.get("ttm_seconds"),
             )
             return 0
 

@@ -56,5 +56,9 @@ htmlcov/
 # Thesis writing workspace
 thesis/
 
+# Workload testing scripts — contents are local only; folder structure tracked via .gitkeep
+test/*
+!test/.gitkeep
+
 CLAUDE.md
 settings.local.json

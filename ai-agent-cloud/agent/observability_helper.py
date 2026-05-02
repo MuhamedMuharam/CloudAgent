@@ -21,6 +21,7 @@ OBSERVABILITY_HELPER_MODEL_DEFAULT = "gpt-4o-mini"
 OBSERVABILITY_ALLOWED_TOOLS: Set[str] = {
     "aws_collect_ec2_health_snapshot",
     "aws_ssm_collect_host_diagnostics",
+    "aws_ssm_get_service_status",
     "aws_list_ec2_instances",
     "aws_get_ec2_instance_status",
     "aws_get_ec2_instance_ssm_status",
@@ -113,7 +114,7 @@ async def run_observability_helper(
     client: OpenAI,
     mcp_client: MCPClientManager,
     model: str = None,
-    max_iterations: int = 6,
+    max_iterations: int = 12,
     analysis_request: str = None,
 ) -> Dict[str, Any]:
     """
@@ -148,8 +149,9 @@ async def run_observability_helper(
                 "Rules:\n"
                 "- Scope MUST follow the controller request. If request is logs-only, do logs-only. If metrics-only, do metrics-only.\n"
                 "- Do not call tools outside requested scope unless needed to close a critical data gap.\n"
-                "- If scope includes host health/status checks, prefer aws_collect_ec2_health_snapshot first.\n"
-                "- For host/system and OS-level checks, use aws_ssm_collect_host_diagnostics when needed.\n"
+                "- If scope includes host health/status checks (but NOT service outage scope), prefer aws_collect_ec2_health_snapshot first.\n"
+                "- For service outage scope (scope contains 'service outage'): do NOT call aws_collect_ec2_health_snapshot, aws_ssm_collect_host_diagnostics, or aws_get_ec2_metrics — they are large and irrelevant for service-down triage; call aws_ssm_get_service_status for each named service directly.\n"
+                "- For host/system and OS-level checks (non-service-outage scope only), use aws_ssm_collect_host_diagnostics when needed.\n"
                 "- For disk-pressure scope, collect host diagnostics and extract actionable filesystem evidence: top large files/paths and inode usage.\n"
                 "- Include concrete file/path names with sizes in evidence when available; if unavailable, explain why in data_gaps.\n"
                 "- Do not call mutating tools.\n"
@@ -161,12 +163,10 @@ async def run_observability_helper(
                 "  * more than 180 minutes -> 900 seconds or more\n"
                 "- If request asks for last hour metrics, prefer aws_get_ec2_metrics with period_seconds=300.\n"
                 "- Log group routing for incident triage:\n"
-                "  * /ai-agent/app -> real-api request flow, input validation, order submission errors\n"
-                "  * /ai-agent/worker -> Celery task execution, retries/failures, processing latency\n"
-                "  * /ai-agent/otel -> OpenTelemetry collector pipeline/export issues to X-Ray\n"
+                "  * /ai-agent/agent -> agent reactions to firing alarms and related decision logs\n"
                 "  * /ai-agent/system -> OS/systemd/network/runtime host-level issues\n"
-                "  * /ai-agent/agent -> alarm_worker and agent orchestration/decision logs\n"
-                "- For root-cause analysis, correlate timestamps across app + worker + otel logs before concluding.\n"
+                "  * /mern-app/api -> MERN application request and error logs (Express, MongoDB, Node.js)\n"
+                "- For root-cause analysis, correlate timestamps across agent + mern-app logs before concluding.\n"
                 "- Avoid dumping long raw payloads in the final answer.\n"
                 "- Return ONLY valid JSON with this exact shape and no markdown:\n"
                 "{\n"

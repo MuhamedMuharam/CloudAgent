@@ -6,9 +6,9 @@
 #   MONGO_URI        - MongoDB Atlas connection string
 #   MONGO_DB         - Database name
 #   JWT_SECRET       - Random 32+ char string (generate: openssl rand -hex 32)
-#   MERN_APP_HOST    - EC2 public IP or domain (e.g. 54.123.45.67)
 #
-# Optional (features degrade gracefully without them):
+# Optional env vars:
+#   MERN_APP_HOST    - EC2 public IP or domain; auto-detected via checkip.amazonaws.com if omitted
 #   SENDGRID_API_KEY, FROM_EMAIL, STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, DEEPAI_API_KEY
 #
 # Optional deployment behavior:
@@ -21,7 +21,9 @@ set -euo pipefail
 : "${MONGO_URI:?MONGO_URI is required}"
 : "${MONGO_DB:?MONGO_DB is required}"
 : "${JWT_SECRET:?JWT_SECRET is required}"
-: "${MERN_APP_HOST:?MERN_APP_HOST is required (EC2 public IP or domain)}"
+# Auto-detect public IP if not supplied — works on any EC2 instance in an ASG
+MERN_APP_HOST="${MERN_APP_HOST:-$(curl -sf --max-time 10 http://checkip.amazonaws.com)}"
+: "${MERN_APP_HOST:?MERN_APP_HOST could not be determined — set it manually or ensure outbound internet access}"
 
 REPO_URL="${MERN_REPO_URL:-https://github.com/Advanced-Computer-Lab-2025/UniVeranstaltungen.git}"
 APP_DIR="/opt/mern-app"
@@ -116,6 +118,18 @@ EOF
 
 cd "$APP_DIR/client"
 npm install --prefer-offline 2>&1 | tail -5
+
+# Patch source files that use process.env (Node.js API — unavailable in Vite browser bundles)
+# and hardcoded localhost URLs that break production builds. Idempotent — safe to re-run.
+echo "  Patching frontend source for production..."
+if [ -f "$APP_DIR/client/src/config/api.ts" ]; then
+  sed -i "s/process\.env\.NODE_ENV === 'production'/import.meta.env.PROD/g" "$APP_DIR/client/src/config/api.ts"
+  sed -i "s/process\.env\.VITE_API_URL/import.meta.env.VITE_API_URL/g" "$APP_DIR/client/src/config/api.ts"
+fi
+if [ -f "$APP_DIR/client/src/pages/WalletPage.tsx" ]; then
+  sed -i "s|const apiUrl = 'http://localhost:4000';|const apiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:4000/api').replace('/api', '');|" "$APP_DIR/client/src/pages/WalletPage.tsx"
+fi
+
 if [[ "$MERN_SKIP_CLIENT_TYPECHECK" == "true" ]]; then
   echo "  MERN_SKIP_CLIENT_TYPECHECK=true -> running Vite build without TypeScript type-check"
   npx vite build
@@ -127,9 +141,19 @@ echo "  Frontend build complete → client/dist/"
 # Correct ownership after npm runs as ec2-user
 sudo chown -R ec2-user:ec2-user "$APP_DIR"
 
-# ── Step 7: Systemd unit ──────────────────────────────────────────────────────
+# ── Step 7: Startup env-updater + Systemd unit ───────────────────────────────
 echo ""
 echo "[7/9] Writing systemd unit..."
+
+# Script that refreshes FRONTEND_URL from the instance's current public IP on
+# every boot — keeps CORS correct after stop/start, resize, or ASG replacement
+cat > "$APP_DIR/update-env.sh" <<'SCRIPT'
+#!/bin/bash
+PUBLIC_IP=$(curl -sf --max-time 10 http://checkip.amazonaws.com)
+[ -n "$PUBLIC_IP" ] && sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=http://$PUBLIC_IP|" /opt/mern-app/server/.env
+SCRIPT
+chmod +x "$APP_DIR/update-env.sh"
+
 cat <<EOF | sudo tee /etc/systemd/system/mern-api.service >/dev/null
 [Unit]
 Description=UniVeranstaltungen MERN API (Express/TypeScript)
@@ -141,6 +165,7 @@ Type=simple
 User=ec2-user
 WorkingDirectory=$APP_DIR/server
 EnvironmentFile=$APP_DIR/server/.env
+ExecStartPre=$APP_DIR/update-env.sh
 ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
@@ -160,9 +185,9 @@ sudo rm -f /etc/nginx/conf.d/default.conf
 
 cat <<EOF | sudo tee /etc/nginx/conf.d/mern-app.conf >/dev/null
 server {
-  listen ${NGINX_PORT};
-  listen [::]:${NGINX_PORT};
-    server_name ${MERN_APP_HOST};
+    listen ${NGINX_PORT} default_server;
+    listen [::]:${NGINX_PORT} default_server;
+    server_name _;
 
     root $APP_DIR/client/dist;
     index index.html;

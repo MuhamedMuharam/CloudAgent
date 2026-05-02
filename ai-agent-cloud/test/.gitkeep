@@ -1,0 +1,13 @@
+# test/
+#
+# This directory contains workload testing scripts for the autonomous cloud agent evaluation.
+#
+# Contents (tracked locally, ignored by .gitignore):
+#   locustfile.py  — Locust load test for the UniVeranstaltungen MERN application.
+#                    Defines four concurrent user classes (LoginBurner, StudentBrowser,
+#                    OfficerBurner, AdminBurner) that drive realistic HTTP traffic to the
+#                    ALB endpoint and trigger ASG CPU-based scaling policies.
+#
+# To run:
+#   pip install locust
+#   locust -f test/locustfile.py --host http://<ALB-DNS>
