@@ -52,7 +52,7 @@ echo "Nginx app port: $NGINX_PORT"
 
 # ── Step 1: OS dependencies ───────────────────────────────────────────────────
 echo ""
-echo "[1/9] Installing OS dependencies..."
+echo "[1/10] Installing OS dependencies..."
 sudo dnf update -y --quiet
 sudo dnf install -y git nginx --quiet
 
@@ -65,16 +65,24 @@ fi
 node --version
 npm --version
 
+# Install AWS X-Ray daemon (relays SDK segments to the X-Ray API)
+echo "  Installing AWS X-Ray daemon..."
+if ! command -v xray >/dev/null 2>&1; then
+  curl -fsSL -O https://s3.amazonaws.com/aws-xray-assets.us-east-1/xray-daemon/aws-xray-daemon-3.x.rpm
+  sudo rpm -U aws-xray-daemon-3.x.rpm
+  rm -f aws-xray-daemon-3.x.rpm
+fi
+
 # ── Step 2: Directories and log files ─────────────────────────────────────────
 echo ""
-echo "[2/9] Preparing directories..."
+echo "[2/10] Preparing directories..."
 sudo mkdir -p "$APP_DIR" "$LOG_DIR"
 sudo touch "$LOG_DIR/api.log"
 sudo chown -R ec2-user:ec2-user "$APP_DIR" "$LOG_DIR"
 
 # ── Step 3: Clone repository ──────────────────────────────────────────────────
 echo ""
-echo "[3/9] Cloning repository..."
+echo "[3/10] Cloning repository..."
 if [ -d "$APP_DIR/server" ]; then
   echo "  Repo already present — pulling latest..."
   git -C "$APP_DIR" pull --ff-only
@@ -82,11 +90,46 @@ else
   git clone --depth 1 "$REPO_URL" "$APP_DIR"
 fi
 
-# ── Step 4: Backend .env ──────────────────────────────────────────────────────
+# ── Step 4: X-Ray instrumentation patch ──────────────────────────────────────
 echo ""
-echo "[4/9] Writing backend .env..."
+echo "[4/10] Patching Express app for X-Ray distributed tracing..."
+if ! grep -q "aws-xray-sdk" "$APP_DIR/server/src/app.ts" 2>/dev/null; then
+python3 << 'PYEOF'
+import sys
+path = '/opt/mern-app/server/src/app.ts'
+content = open(path).read()
+
+xray_open = """
+
+// X-Ray distributed tracing
+const AWSXRay = require('aws-xray-sdk');
+AWSXRay.config([AWSXRay.plugins.EC2Plugin]);
+app.use(AWSXRay.express.openSegment('MERN-API'));"""
+
+if 'aws-xray-sdk' in content:
+    print('  app.ts already patched — skipping')
+    sys.exit(0)
+
+content = content.replace('const app = express();', 'const app = express();' + xray_open)
+
+xray_close = """// X-Ray close segment (after all routes, before error handlers)
+app.use(AWSXRay.express.closeSegment());
+
+"""
+content = content.replace('// Not found', xray_close + '// Not found')
+open(path, 'w').write(content)
+print('  app.ts patched successfully')
+PYEOF
+else
+  echo "  app.ts already contains X-Ray instrumentation — skipping patch"
+fi
+
+# ── Step 5: Backend .env ──────────────────────────────────────────────────────
+echo ""
+echo "[5/10] Writing backend .env..."
 cat > "$APP_DIR/server/.env" <<EOF
 NODE_ENV=production
+AWS_XRAY_DAEMON_ADDRESS=localhost:2000
 PORT=$BACKEND_PORT
 MONGO_URI=$MONGO_URI
 MONGO_DB=$MONGO_DB
@@ -100,17 +143,18 @@ DEEPAI_API_KEY=$DEEPAI_API_KEY
 EOF
 chmod 600 "$APP_DIR/server/.env"
 
-# ── Step 5: Build backend (TypeScript → dist/) ────────────────────────────────
+# ── Step 6: Build backend (TypeScript → dist/) ────────────────────────────────
 echo ""
-echo "[5/9] Building backend..."
+echo "[6/10] Building backend..."
 cd "$APP_DIR/server"
 npm install --prefer-offline 2>&1 | tail -5
+npm install aws-xray-sdk 2>&1 | tail -3
 npm run build
 echo "  Backend build complete → server/dist/"
 
-# ── Step 6: Frontend .env + build (Vite → dist/) ─────────────────────────────
+# ── Step 7: Frontend .env + build (Vite → dist/) ─────────────────────────────
 echo ""
-echo "[6/9] Building frontend..."
+echo "[7/10] Building frontend..."
 # VITE_API_URL uses a relative path so it works regardless of IP/domain changes
 cat > "$APP_DIR/client/.env" <<EOF
 VITE_API_URL=/api
@@ -141,9 +185,9 @@ echo "  Frontend build complete → client/dist/"
 # Correct ownership after npm runs as ec2-user
 sudo chown -R ec2-user:ec2-user "$APP_DIR"
 
-# ── Step 7: Startup env-updater + Systemd unit ───────────────────────────────
+# ── Step 8: Startup env-updater + Systemd unit ───────────────────────────────
 echo ""
-echo "[7/9] Writing systemd unit..."
+echo "[8/10] Writing systemd unit..."
 
 # Script that refreshes FRONTEND_URL from the instance's current public IP on
 # every boot — keeps CORS correct after stop/start, resize, or ASG replacement
@@ -176,9 +220,9 @@ StandardError=append:$LOG_DIR/api.log
 WantedBy=multi-user.target
 EOF
 
-# ── Step 8: Nginx config ──────────────────────────────────────────────────────
+# ── Step 9: Nginx config ──────────────────────────────────────────────────────
 echo ""
-echo "[8/9] Configuring Nginx..."
+echo "[9/10] Configuring Nginx..."
 
 # Disable default nginx site if present
 sudo rm -f /etc/nginx/conf.d/default.conf
@@ -217,12 +261,12 @@ EOF
 
 sudo nginx -t  # validate config before reloading
 
-# ── Step 9: Enable and start services ─────────────────────────────────────────
+# ── Step 10: Enable and start services ────────────────────────────────────────
 echo ""
-echo "[9/9] Starting services..."
+echo "[10/10] Starting services..."
 sudo systemctl daemon-reload
-sudo systemctl enable mern-api.service nginx
-sudo systemctl restart mern-api.service nginx
+sudo systemctl enable mern-api.service nginx xray
+sudo systemctl restart mern-api.service nginx xray
 
 sleep 3
 echo ""
@@ -235,7 +279,7 @@ echo " Logs:      $LOG_DIR/api.log"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 echo " Service status:"
-sudo systemctl is-active mern-api.service nginx
+sudo systemctl is-active mern-api.service nginx xray
 
 echo ""
 echo " Quick health check:"

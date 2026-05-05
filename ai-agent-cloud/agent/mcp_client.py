@@ -44,8 +44,6 @@ class MCPClientManager:
         self.sessions: Dict[str, ClientSession] = {}
         self.tools: Dict[str, Dict] = {}  # tool_name -> tool_definition
         self.tool_server_mapping: Dict[str, str] = {}  # tool_name -> server_name
-        self.prompts: Dict[str, Dict] = {}  # prompt_name -> prompt definition
-        self.prompt_server_mapping: Dict[str, str] = {}  # prompt_name -> server_name
         self.exit_stack = AsyncExitStack()
     
     async def connect_to_server(self, server_name: str, command: str, args: List[str] = None, env: Dict[str, str] = None):
@@ -180,94 +178,10 @@ class MCPClientManager:
             except Exception as e:
                 print(f"❌ Error discovering tools from {server_name}: {e}")
 
-    async def discover_prompts(self):
-        """
-        Discover prompt templates from all connected MCP servers.
-
-        Populates:
-        - self.prompts: {prompt_name: {name, description, arguments}}
-        - self.prompt_server_mapping: {prompt_name: server_name}
-        """
-        self.prompts = {}
-        self.prompt_server_mapping = {}
-
-        for server_name, session in self.sessions.items():
-            try:
-                prompts_result = await session.list_prompts()
-
-                for prompt in prompts_result.prompts:
-                    prompt_name = prompt.name
-                    self.prompts[prompt_name] = {
-                        "name": prompt_name,
-                        "description": getattr(prompt, "description", ""),
-                        "arguments": [
-                            {
-                                "name": arg.name,
-                                "description": getattr(arg, "description", ""),
-                                "required": getattr(arg, "required", False),
-                            }
-                            for arg in getattr(prompt, "arguments", [])
-                        ],
-                    }
-                    self.prompt_server_mapping[prompt_name] = server_name
-
-                print(f"🧠 Discovered {len(prompts_result.prompts)} prompts from {server_name}")
-
-            except Exception as e:
-                print(f"❌ Error discovering prompts from {server_name}: {e}")
-
     async def discover_capabilities(self):
-        """Discover tools and prompts from connected MCP servers."""
+        """Discover tools from connected MCP servers."""
         await self.discover_tools()
-        await self.discover_prompts()
 
-    async def get_prompt(self, prompt_name: str, arguments: Dict[str, str] = None) -> str:
-        """
-        Render an MCP prompt template with optional string arguments.
-
-        Returns:
-            JSON string containing the rendered prompt message sequence.
-        """
-        if prompt_name not in self.prompt_server_mapping:
-            raise ValueError(f"Unknown MCP prompt: {prompt_name}")
-
-        server_name = self.prompt_server_mapping[prompt_name]
-        session = self.sessions[server_name]
-        result = await session.get_prompt(prompt_name, arguments or {})
-
-        normalized_messages = []
-        for msg in result.messages:
-            content = msg.content
-            content_payload = {
-                "type": getattr(content, "type", content.__class__.__name__),
-            }
-
-            if hasattr(content, "text"):
-                content_payload["text"] = content.text
-            if hasattr(content, "data"):
-                content_payload["data"] = content.data
-            if hasattr(content, "mimeType"):
-                content_payload["mime_type"] = content.mimeType
-            if hasattr(content, "resource"):
-                content_payload["resource"] = str(content.resource)
-
-            normalized_messages.append(
-                {
-                    "role": msg.role,
-                    "content": content_payload,
-                }
-            )
-
-        return json.dumps(
-            {
-                "success": True,
-                "name": prompt_name,
-                "server": server_name,
-                "description": result.description,
-                "messages": normalized_messages,
-            }
-        )
-    
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """
         Call a tool on the appropriate MCP server.
@@ -314,20 +228,6 @@ class MCPClientManager:
                 {"name": "web-server", "cpu": 2, "ram_gb": 4}
             )
         """
-        if tool_name == "get_mcp_prompt":
-            prompt_name = arguments.get("name")
-            if not prompt_name:
-                raise ValueError("get_mcp_prompt requires 'name'")
-
-            prompt_args = arguments.get("arguments", {})
-            if prompt_args is None:
-                prompt_args = {}
-            if not isinstance(prompt_args, dict):
-                raise ValueError("get_mcp_prompt 'arguments' must be an object")
-
-            normalized_prompt_args = {str(k): str(v) for k, v in prompt_args.items()}
-            return await self.get_prompt(prompt_name, normalized_prompt_args)
-
         # STEP 1: Find which server provides this tool
         # (from mapping built during discover_tools())
         if tool_name not in self.tool_server_mapping:
@@ -408,32 +308,6 @@ class MCPClientManager:
                 }
             })
 
-        # Synthetic helper for MCP prompt templates.
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": "get_mcp_prompt",
-                "description": "Render an MCP prompt template by name with optional arguments.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "MCP prompt name",
-                        },
-                        "arguments": {
-                            "type": "object",
-                            "description": "Prompt arguments as string key/value pairs",
-                            "additionalProperties": {
-                                "type": "string",
-                            },
-                        },
-                    },
-                    "required": ["name"],
-                },
-            },
-        })
-        
         return openai_tools
     
     async def close(self):

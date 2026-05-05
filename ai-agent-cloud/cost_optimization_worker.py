@@ -348,6 +348,8 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
         )
         await mcp_client.discover_capabilities()
 
+        tool_call_count = 0
+
         analysis_args = _without_none_fields({
             "minutes": config["analysis_minutes"],
             "period_seconds": config["analysis_period_seconds"],
@@ -366,6 +368,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
         _log_event(logger, logging.INFO, "fleet_analysis_started", mode=config["mode"], args=analysis_args)
 
         analysis_raw = await mcp_client.call_tool("aws_analyze_ec2_fleet_cost_optimization", analysis_args)
+        tool_call_count += 1
         analysis = _safe_parse_tool_result(analysis_raw)
 
         if not analysis.get("success"):
@@ -374,6 +377,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                 "mode": config["mode"],
                 "error": "fleet_analysis_failed",
                 "analysis_result": analysis,
+                "trajectory_length": tool_call_count,
             }
 
         instances = analysis.get("instances", []) if isinstance(analysis, dict) else []
@@ -424,6 +428,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
         }
 
         if config["mode"] != "take_action":
+            cycle_result["trajectory_length"] = tool_call_count
             _log_event(
                 logger,
                 logging.INFO,
@@ -477,6 +482,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
             )
 
             apply_raw = await mcp_client.call_tool("aws_apply_ec2_rightsizing", apply_args)
+            tool_call_count += 1
             apply_result = _safe_parse_tool_result(apply_raw)
 
             action_payload = {
@@ -509,6 +515,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                         "aws_sync_asg_launch_template_after_resize",
                         {"instance_id": instance_id, "new_instance_type": actual_new_type},
                     )
+                    tool_call_count += 1
                     sync_result = _safe_parse_tool_result(sync_raw)
                     action_payload["asg_sync_result"] = sync_result
 
@@ -525,6 +532,7 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
                         success=bool(sync_result.get("success")),
                     )
 
+        cycle_result["trajectory_length"] = tool_call_count
         return cycle_result
 
     finally:
@@ -666,12 +674,18 @@ def run_cost_optimization_worker() -> int:
         cycle_result["started_at"] = started_at.isoformat()
         cycle_result["completed_at"] = completed_at.isoformat()
         actions_applied = len(cycle_result.get("applied_actions", []))
+        trajectory_length = cycle_result.get("trajectory_length")
+        total_run_seconds = (completed_at - started_at).total_seconds()
         ttm_seconds = (
-            (completed_at - started_at).total_seconds()
+            total_run_seconds
             if config["mode"] == "take_action" and actions_applied > 0
             else None
         )
+        # e2e: total wall-clock time from worker start to completion.
+        # Equals ttm when mutating actions were taken; otherwise the full diagnostic run time.
+        e2e_seconds = round(ttm_seconds if ttm_seconds is not None else total_run_seconds, 1)
         cycle_result["ttm_seconds"] = round(ttm_seconds, 1) if ttm_seconds is not None else None
+        cycle_result["e2e_seconds"] = e2e_seconds
 
         state_manager.log_action(
             action_type="cost_optimization_service_run",
@@ -734,7 +748,9 @@ def run_cost_optimization_worker() -> int:
                 mode=config["mode"],
                 summary=summary,
                 applied_actions=actions_applied,
+                trajectory_length=trajectory_length,
                 ttm_seconds=cycle_result.get("ttm_seconds"),
+                e2e_seconds=cycle_result.get("e2e_seconds"),
             )
             return 0
 

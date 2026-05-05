@@ -333,8 +333,15 @@ def _build_goal(
         f"Execution mode: {mitigation_mode}. "
         f"target_os for SSM tools: {target_os}. "
         f"Allowed automatic service restarts: {allowed_service_list}. "
-        f"Reboot allowed for status-check failures: {allow_reboot_on_status_check_failure}. "
-        f"Disk cleanup apply mode allowed: {allow_disk_cleanup_apply}. "
+        + (
+            "Reboot is PERMITTED and REQUIRED for unresolved status-check failures. "
+            "If diagnostics confirm StatusCheckFailed_Instance is active and no SSM-based fix resolves it, "
+            "call aws_reboot_ec2_instance immediately. "
+            "Do NOT ask for confirmation — execute the reboot autonomously. "
+            if allow_reboot_on_status_check_failure
+            else "Reboot is NOT permitted for status-check failures; recommend it to the operator instead. "
+        )
+        + f"Disk cleanup apply mode allowed: {allow_disk_cleanup_apply}. "
         "If mode is recommend-only, do not execute mutating actions. "
         "If mode is execute-safe-mitigations: run diagnostics first, prefer reversible actions, "
         "and only execute changes that match the permissions above. "
@@ -508,6 +515,9 @@ def run_alarm_worker() -> None:
                         error=str(exc),
                     )
 
+            processing_end = datetime.now(timezone.utc)
+            agent_run_seconds = (processing_end - processing_start).total_seconds()
+
             ttm_seconds = (
                 last_agent_result.get("ttm_seconds")
                 if isinstance(last_agent_result, dict) else None
@@ -516,13 +526,13 @@ def run_alarm_worker() -> None:
                 last_agent_result.get("trajectory_length")
                 if isinstance(last_agent_result, dict) else None
             )
-            # e2e: total clock time from alarm firing to last mutating action.
-            # e2e = notification_delay + ttm (agent diagnosis + remediation time).
-            e2e_seconds = (
-                round(notification_delay_seconds + ttm_seconds, 1)
-                if notification_delay_seconds is not None and ttm_seconds is not None
-                else None
-            )
+            # e2e: total clock time from alarm firing to end of agent run.
+            # If ttm is available (mutating action was taken): e2e = notification_delay + ttm.
+            # Otherwise: e2e = notification_delay + agent_run_seconds (full diagnostic run time).
+            # notification_delay defaults to 0.0 when state_change_time is unavailable.
+            _notification_delay = notification_delay_seconds if notification_delay_seconds is not None else 0.0
+            _agent_time = ttm_seconds if ttm_seconds is not None else agent_run_seconds
+            e2e_seconds = round(_notification_delay + _agent_time, 1)
 
             should_acknowledge = bool(receipt_handle) and (agent_success or not require_success_for_ack)
             if should_acknowledge:

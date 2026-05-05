@@ -65,7 +65,6 @@ BASE_SYSTEM_PROMPT = (
     "- Prefer cost-efficient resources unless explicitly asked otherwise\n"
     "- For cost-optimization tasks, default to recommendation-only analysis unless the user explicitly asks to execute changes\n"
     "- Validate assumptions by calling tools before concluding\n"
-    "- If user asks to use a named MCP prompt template, call get_mcp_prompt first\n"
     "- For host-level operations on EC2 instances, prefer SSM tools over ad-hoc shell approaches\n"
     "- For logs/metrics/traces analysis, use delegate_observability_analysis \n"
     "- You may also use MCP observability tools directly for targeted checks\n"
@@ -165,8 +164,10 @@ INSTRUCTION_PACKS = {
     ),
     "xray_tracing": (
         "X-RAY TRACE ANALYSIS:\n"
+        "- Known X-Ray service names in this environment: 'MERN-API' (Express/Node.js backend)\n"
+        "- When the goal refers to the MERN application, API, or backend without naming a service, use service_names=[\"MERN-API\"]\n"
         "- Prefer aws_get_xray_trace_summaries first, then drill down with aws_get_xray_trace_details when needed\n"
-        "- If the goal includes a service name, pass it via service_names (example: [\"real-api\"])\n"
+        "- If the goal includes a service name, pass it via service_names (example: [\"MERN-API\"])\n"
         "- Never pass EC2 instance names or instance IDs as service_names\n"
         "- If goal mentions instance but not service: call aws_get_xray_trace_summaries with exclude_loopback_only=true and no service_names, then use analysis.top_service_names to choose service_names for a second query\n"
         "- For generic trace requests with no service specified, set exclude_loopback_only=true to avoid localhost-only noise\n"
@@ -304,7 +305,7 @@ def build_system_prompt(goal: str) -> str:
     if "vpc" in goal_text and any(k in goal_text for k in ["delete", "remove", "destroy"]):
         parts.append(INSTRUCTION_PACKS["vpc_deletion"])
 
-    if any(k in goal_text for k in ["alarm", "cloudwatch", "dashboard", "log", "metric", "incident", "root cause", "mitigation"]):
+    if any(k in goal_text for k in ["alarm", "cloudwatch", "log", "metric", "incident", "root cause", "mitigation"]):
         parts.append(INSTRUCTION_PACKS["cloudwatch_alarms"])
 
     if any(k in goal_text for k in [
@@ -323,25 +324,6 @@ def build_system_prompt(goal: str) -> str:
 
     parts.append("Complete tasks immediately and report what you did.")
     return "\n\n".join(parts)
-
-
-def build_prompt_catalog(mcp_client: MCPClientManager) -> str:
-    """Build a compact non-tool capability catalog for MCP prompts only."""
-    catalog = {
-        "prompts": sorted(list(mcp_client.prompts.keys())),
-    }
-    return (
-        "MCP PROMPT CATALOG (discoverable before planning):\n"
-        f"{json.dumps(catalog, indent=2)}\n\n"
-        "Note: MCP tools are provided separately via the API tools field. "
-        "Use get_mcp_prompt with the catalog above when relevant."
-    )
-
-
-def find_prompt_mentions(goal: str, prompt_names: list) -> list:
-    """Find prompt names explicitly mentioned in user goal."""
-    goal_lc = (goal or "").lower()
-    return [name for name in prompt_names if name.lower() in goal_lc]
 
 
 def is_cost_optimization_goal(goal: str) -> bool:
@@ -512,11 +494,6 @@ async def run_agent(goal: str, mcp_servers: list = None):
         for tool in tools:
             print(f"   - {tool['function']['name']}")
 
-        if mcp_client.prompts:
-            print(f"\n🧠 Available prompts: {len(mcp_client.prompts)}")
-            for prompt_name in mcp_client.prompts.keys():
-                print(f"   - {prompt_name}")
-        
         # Track actions for this goal
         cost_goal = is_cost_optimization_goal(goal)
         explicit_execution_intent = has_explicit_execution_intent(goal)
@@ -535,10 +512,6 @@ async def run_agent(goal: str, mcp_servers: list = None):
             {
                 "role": "system",
                 "content": build_policy_discovery_hint(policy_engine.policies)
-            },
-            {
-                "role": "system",
-                "content": build_prompt_catalog(mcp_client)
             },
         ]
 
@@ -589,67 +562,15 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 }
             )
 
-        # Deterministic pre-router: preload explicitly requested MCP prompts
-        # before the first model turn so the model starts with grounded context.
-        preloaded_items = []
-
-        mentioned_prompts = find_prompt_mentions(goal, list(mcp_client.prompts.keys()))
-        for prompt_name in mentioned_prompts:
-            prompt_def = mcp_client.prompts.get(prompt_name, {})
-            required_args = [
-                arg.get("name") for arg in prompt_def.get("arguments", []) if arg.get("required")
-            ]
-
-            if required_args:
-                preloaded_items.append(
-                    {
-                        "kind": "prompt",
-                        "id": prompt_name,
-                        "error": f"Skipped auto-render: missing required args {required_args}",
-                    }
-                )
-                continue
-
-            try:
-                preloaded_prompt = await mcp_client.get_prompt(prompt_name, {})
-                preloaded_items.append(
-                    {
-                        "kind": "prompt",
-                        "id": prompt_name,
-                        "result": preloaded_prompt,
-                    }
-                )
-                actions_taken.append(f"get_mcp_prompt({json.dumps({'name': prompt_name, 'arguments': {}})})")
-            except Exception as e:
-                preloaded_items.append(
-                    {
-                        "kind": "prompt",
-                        "id": prompt_name,
-                        "error": str(e),
-                    }
-                )
-
-        if preloaded_items:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "PRELOADED MCP CONTEXT (auto-fetched before planning):\n"
-                        f"{json.dumps(preloaded_items, indent=2)}"
-                    ),
-                }
-            )
-        
         print(f"\n🎯 Agent Goal: {goal}\n")
         print(f"🧠 Main controller model: {controller_model}")
         print("=" * 60)
         
         # Main agent loop
         iteration = 0
-        max_iterations = 10  # Prevent infinite loops (reduced to avoid retries on transient errors)
+        max_iterations = 15  # Prevent infinite loops (reduced to avoid retries on transient errors)
         helper_invoked_for_goal = False
-        # actions_taken initialized before pre-router to include preloaded MCP reads
-        
+
         while iteration < max_iterations:
             iteration += 1
             

@@ -2354,68 +2354,6 @@ async def aws_get_dashboard(dashboard_name: str = None) -> dict:
         }
 
 
-@mcp.prompt()
-def aws_incident_triage_prompt(
-    incident_summary: str,
-    severity: str = "SEV2",
-    instance_id: str = "",
-    log_group_name: str = "",
-) -> str:
-    """
-    Prompt template for EC2/CloudWatch incident triage and first-response actions.
-    """
-    resolved_instance_id = instance_id or default_instance_id or "<unknown-instance-id>"
-    resolved_log_group = log_group_name or default_log_group or "<unknown-log-group>"
-
-    return (
-        "You are the on-call cloud reliability engineer for AWS infrastructure.\\n"
-        f"Severity: {severity}\\n"
-        f"Incident summary: {incident_summary}\\n"
-        f"Target instance: {resolved_instance_id}\\n"
-        f"Target log group: {resolved_log_group}\\n\\n"
-        "Perform triage in this order:\\n"
-        "1) Confirm current instance health and status-check metrics over last 15 minutes.\\n"
-        "2) Identify active ALARM state CloudWatch alarms for this instance by dimension InstanceId.\\n"
-        "3) Pull recent logs and find first error signature and latest recurring pattern.\\n"
-        "4) Correlate timeline across alarms, metrics spikes, and logs.\\n"
-        "5) Propose immediate mitigations and rollback/safety checks.\\n\\n"
-        "Use these MCP tools where applicable:\\n"
-        "- Tool: aws_poll_alarm_notifications\n"
-        "- Tool: aws_collect_ec2_health_snapshot\\n"
-        "- Tool: aws_get_ec2_metrics\\n"
-        "- Tool: aws_list_ec2_alarms\\n"
-        "- Tool: aws_filter_logs\\n"
-        "- Tool: aws_get_log_events\\n\\n"
-        "Output format:\\n"
-        "- Situation summary (3-5 bullets)\\n"
-        "- Most likely root cause\\n"
-        "- Confidence (High/Medium/Low) with evidence\\n"
-        "- Immediate mitigation plan\\n"
-        "- 24-hour prevention follow-up actions"
-    )
-
-
-@mcp.prompt()
-def aws_observability_snapshot_interpreter_prompt(
-    snapshot_json: str,
-    objective: str = "Diagnose likely cause and propose mitigation",
-) -> str:
-    """
-    Prompt template to interpret an observability snapshot payload.
-    """
-    return (
-        "You are analyzing an AWS observability snapshot containing metrics, logs, and alarms.\\n"
-        f"Objective: {objective}\\n\\n"
-        "Snapshot JSON:\\n"
-        f"{snapshot_json}\\n\\n"
-        "Provide:\\n"
-        "1) Top anomalies detected\\n"
-        "2) Probable root cause hypotheses ranked by likelihood\\n"
-        "3) Fast mitigation actions that are safe and reversible\\n"
-        "4) Additional data needed to confirm root cause"
-    )
-
-
 # ========================================
 # VPC MANAGEMENT TOOLS
 # ========================================
