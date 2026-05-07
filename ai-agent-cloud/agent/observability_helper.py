@@ -10,8 +10,7 @@ import json
 import os
 from typing import Any, Dict, List, Set
 
-from openai import OpenAI
-
+from .llm_provider import create_provider
 from .mcp_client import MCPClientManager
 
 
@@ -111,7 +110,6 @@ def _normalize_helper_report(raw_content: str) -> Dict[str, Any]:
 
 async def run_observability_helper(
     goal: str,
-    client: OpenAI,
     mcp_client: MCPClientManager,
     model: str = None,
     max_iterations: int = 12,
@@ -124,6 +122,7 @@ async def run_observability_helper(
     controller context.
     """
     helper_model = model or os.getenv("OBSERVABILITY_HELPER_MODEL", OBSERVABILITY_HELPER_MODEL_DEFAULT)
+    provider = create_provider(name=os.getenv("LLM_PROVIDER", "openai"), model=helper_model)
     helper_tools = _select_observability_tools(mcp_client.get_tools_for_openai())
     allowed_names = {
         tool.get("function", {}).get("name", "")
@@ -193,33 +192,18 @@ async def run_observability_helper(
     tools_used: List[str] = []
 
     for iteration in range(1, max_iterations + 1):
-        response = client.chat.completions.create(
-            model=helper_model,
-            messages=messages,
-            tools=helper_tools,
-            tool_choice="auto",
-        )
+        response = provider.complete(messages, helper_tools)
 
-        msg = response.choices[0].message
-
-        if msg.tool_calls:
-            messages.append(msg)
-            for tool_call in msg.tool_calls:
-                tool_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
+        if response.tool_calls:
+            provider.append_response(messages, response)
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.name
+                args = tool_call.arguments
 
                 if tool_name not in allowed_names:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps(
-                                {
-                                    "success": False,
-                                    "error": f"Tool '{tool_name}' is not allowed in observability helper.",
-                                }
-                            ),
-                        }
+                    provider.append_tool_result(
+                        messages, tool_call.id,
+                        json.dumps({"success": False, "error": f"Tool '{tool_name}' is not allowed in observability helper."}),
                     )
                     continue
 
@@ -227,24 +211,12 @@ async def run_observability_helper(
                     result = await mcp_client.call_tool(tool_name, args)
                     tools_used.append(tool_name)
                     result_text = result if isinstance(result, str) else json.dumps(result)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": _truncate_payload(result_text),
-                        }
-                    )
+                    provider.append_tool_result(messages, tool_call.id, _truncate_payload(result_text))
                 except Exception as exc:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps({"success": False, "error": str(exc)}),
-                        }
-                    )
+                    provider.append_tool_result(messages, tool_call.id, json.dumps({"success": False, "error": str(exc)}))
             continue
 
-        summary = (msg.content or "").strip()
+        summary = (response.content or "").strip()
         report = _normalize_helper_report(summary)
 
         return {

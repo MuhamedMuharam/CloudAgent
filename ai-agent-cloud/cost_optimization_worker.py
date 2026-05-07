@@ -306,6 +306,7 @@ def _select_resize_candidates(
                     "target_instance_type": target_type,
                     "estimated_monthly_savings": estimated_monthly_savings,
                     "skip_reasons": skip_reasons,
+                    "utilization_signal": utilization_signal,
                 }
             )
             continue
@@ -397,7 +398,12 @@ async def _run_cost_optimization_cycle(config: Dict[str, Any], logger: logging.L
         skipped_reasons_summary: Dict[str, List[str]] = {}
         for item in skipped_candidates:
             label = item.get("instance_name") or item.get("instance_id") or "unknown"
-            skipped_reasons_summary[label] = item.get("skip_reasons", [])
+            signal = item.get("utilization_signal") or ""
+            reasons = [
+                f"no_downsize_signal({signal})" if r == "no_downsize_signal" and signal else r
+                for r in item.get("skip_reasons", [])
+            ]
+            skipped_reasons_summary[label] = reasons
 
         cycle_result = {
             "success": True,

@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv  # Load .env file with credentials
-from openai import OpenAI, RateLimitError  # GPT-4 for planning and reasoning
+from .llm_provider import LLMProvider, create_provider
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
 from .state_manager import StateManager  # State tracking and audit logs
 from .policy_engine import PolicyEngine, PolicyViolation  # Policy validation
@@ -405,10 +405,11 @@ async def run_agent(goal: str, mcp_servers: list = None):
     # STEP 1: Initialize Components
     # ═══════════════════════════════════════════════════════════════
     
-    # Initialize OpenAI client for GPT-4 reasoning
-    # GPT-4 will plan actions, decide which tools to call, and evaluate results
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     controller_model = os.getenv("MAIN_CONTROLLER_MODEL", MAIN_CONTROLLER_MODEL_DEFAULT)
+    provider: LLMProvider = create_provider(
+        name=os.getenv("LLM_PROVIDER", "openai"),
+        model=controller_model,
+    )
     
     # Initialize MCP client manager
     # This will spawn MCP servers as subprocesses and communicate via stdio
@@ -574,33 +575,16 @@ async def run_agent(goal: str, mcp_servers: list = None):
         while iteration < max_iterations:
             iteration += 1
             
-            # Call OpenAI with available tools (retry on rate limit)
-            for _attempt in range(4):
-                try:
-                    response = client.chat.completions.create(
-                        model=controller_model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice="auto"
-                    )
-                    break
-                except RateLimitError as _rle:
-                    if _attempt == 3:
-                        raise
-                    _wait = 15 * (2 ** _attempt)  # 15s, 30s, 60s
-                    print(f"⏳ Rate limit hit, retrying in {_wait}s... ({_rle})")
-                    time.sleep(_wait)
-            
-            msg = response.choices[0].message
-            
+            response = provider.complete(messages, tools)
+
             # If AI decides to call tools
-            if msg.tool_calls:
-                messages.append(msg)
-                
+            if response.tool_calls:
+                provider.append_response(messages, response)
+
                 # Process all tool calls
-                for tool_call in msg.tool_calls:
-                    tool_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.name
+                    args = tool_call.arguments
                     
                     print(f"\n🔧 Calling Tool: {tool_name}")
                     print(f"   Arguments: {json.dumps(args, indent=6)}")
@@ -615,11 +599,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                     "Provide a focused telemetry task for this step "
                                     "(scope/target/time window when relevant)."
                                 )
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": json.dumps({"success": False, "error": guidance}),
-                                })
+                                provider.append_tool_result(messages, tool_call.id, json.dumps({"success": False, "error": guidance}))
                                 continue
 
                             # Inject resolved instance_id into the request so the helper
@@ -636,7 +616,6 @@ async def run_agent(goal: str, mcp_servers: list = None):
                             print(f"🛰️ Helper analysis_request: {helper_request}")
                             helper_result = await run_observability_helper(
                                 goal=goal,
-                                client=client,
                                 mcp_client=mcp_client,
                                 model=helper_model,
                                 analysis_request=helper_request,
@@ -689,11 +668,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 "report": helper_report,
                             }
 
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": json.dumps(delegated_result),
-                            })
+                            provider.append_tool_result(messages, tool_call.id, json.dumps(delegated_result))
                             helper_invoked_for_goal = True
                             continue
 
@@ -711,11 +686,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 "For this observability-heavy goal, call delegate_observability_analysis first. "
                                 "Then use direct telemetry tools only for targeted follow-up verification."
                             )
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": json.dumps({"success": False, "error": guidance}),
-                            })
+                            provider.append_tool_result(messages, tool_call.id, json.dumps({"success": False, "error": guidance}))
                             continue
 
                         if recommendation_only_cost_mode and tool_name in {
@@ -735,11 +706,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 "User did not explicitly request execution of mutating actions."
                             )
                             print(f"⚠️  {blocked_msg}")
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": json.dumps({"success": False, "error": blocked_msg}),
-                            })
+                            provider.append_tool_result(messages, tool_call.id, json.dumps({"success": False, "error": blocked_msg}))
                             continue
 
                         # STEP 1: Validate action against policies (BEFORE execution)
@@ -791,12 +758,8 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                 "error": f"Policy violation: {str(e)}"
                             })
                             
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": error_result
-                            })
-                            
+                            provider.append_tool_result(messages, tool_call.id, error_result)
+
                             # Log the blocked action
                             state_manager.log_action(
                                 action_type=f"{tool_name}_blocked",
@@ -872,11 +835,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                             print(f"   {result}")
                         
                         # Add tool result to conversation
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result
-                        })
+                        provider.append_tool_result(messages, tool_call.id, result)
                     
                     except Exception as e:
                         error_result = json.dumps({
@@ -886,23 +845,19 @@ async def run_agent(goal: str, mcp_servers: list = None):
                         
                         print(f"❌ Tool Error: {e}")
                         
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": error_result
-                        })
+                        provider.append_tool_result(messages, tool_call.id, error_result)
             
             else:
                 # Agent has finished - no more tool calls
                 print("\n" + "=" * 60)
                 print("🧠 Final Agent Response:\n")
-                print(msg.content)
+                print(response.content)
                 print("\n" + "=" * 60)
-                
+
                 # Log goal execution
                 state_manager.log_goal_execution(
                     goal=goal,
-                    outcome=msg.content if msg.content else "Completed",
+                    outcome=response.content if response.content else "Completed",
                     actions_taken=actions_taken
                 )
 
@@ -914,7 +869,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                 execution_result = {
                     "success": True,
                     "goal": goal,
-                    "outcome": msg.content if msg.content else "Completed",
+                    "outcome": response.content if response.content else "Completed",
                     "reason": "completed",
                     "actions_taken": actions_taken,
                     "iterations": iteration,
