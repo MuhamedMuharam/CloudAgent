@@ -270,6 +270,8 @@ If you only change variable values, you usually do not need a new image.
 aws s3 cp config/cost_optimization/cost-optimization.worker.env s3://YOUR_BUCKET/ecs/env/cost-optimization.env --region us-east-1 --sse AES256
 ```
 
+> **PowerShell note:** Do not use `\` for line continuation — it will cause a parser error. Run the command as a single line, or use backtick `` ` `` for continuation instead.
+
 In this case, task definition and schedule usually remain unchanged.
 
 ### Case B: New S3 object key/path

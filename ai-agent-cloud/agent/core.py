@@ -769,7 +769,37 @@ async def run_agent(goal: str, mcp_servers: list = None):
                             )
                             
                             continue  # Skip to next tool call
-                        
+
+                        # STEP 1.5: Human-in-the-loop gate for risky actions
+                        if os.getenv("HITL_ENABLED", "true").lower() == "true":
+                            from hitl import should_gate, request_human_approval
+                            gate, risk_reason = should_gate(tool_name, args)
+                            if gate:
+                                hitl_timeout = int(os.getenv("HITL_APPROVAL_TIMEOUT_SECONDS", "300"))
+                                approved = await request_human_approval(
+                                    tool_name=tool_name,
+                                    args=args,
+                                    goal=goal,
+                                    risk_reason=risk_reason,
+                                    timeout_seconds=hitl_timeout,
+                                )
+                                if not approved:
+                                    provider.append_tool_result(
+                                        messages,
+                                        tool_call.id,
+                                        json.dumps({
+                                            "success": False,
+                                            "error": "Action denied by human operator (HITL gate).",
+                                        }),
+                                    )
+                                    state_manager.log_action(
+                                        action_type=f"{tool_name}_denied_by_hitl",
+                                        details={"args": args, "risk_reason": risk_reason},
+                                        success=False,
+                                        error="Human denied HITL gate",
+                                    )
+                                    continue
+
                         # STEP 2: Execute tool via MCP (only if policy allows)
                         result = await mcp_client.call_tool(tool_name, args)
                         

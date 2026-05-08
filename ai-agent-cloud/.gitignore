@@ -62,3 +62,8 @@ test/*
 
 CLAUDE.md
 settings.local.json
+
+# HITL pending approvals (runtime files, never commit)
+hitl/pending/*.json
+hitl/pending/*.approved
+hitl/pending/*.denied
