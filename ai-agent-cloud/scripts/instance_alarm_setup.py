@@ -29,6 +29,11 @@ import re
 import sys
 import urllib.request
 
+# Clear any user-level AWS credentials from the environment so boto3 falls
+# back to the EC2 instance profile (IAM role) instead of the ai-agent IAM user.
+for _var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+    os.environ.pop(_var, None)
+
 import boto3
 from botocore.exceptions import ClientError
 
