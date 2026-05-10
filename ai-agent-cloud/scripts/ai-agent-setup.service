@@ -25,7 +25,7 @@ WorkingDirectory=/home/ec2-user/CloudAgent/ai-agent-cloud
 ExecStart=/home/ec2-user/CloudAgent/ai-agent-cloud/venv/bin/python \
     /home/ec2-user/CloudAgent/ai-agent-cloud/scripts/instance_alarm_setup.py
 # Restart the alarm worker so it re-reads the patched .env with the new queue URL.
-ExecStartPost=/bin/systemctl restart ai-agent.service
+ExecStartPost=/bin/systemctl --no-block restart ai-agent.service
 
 StandardOutput=journal
 StandardError=journal
