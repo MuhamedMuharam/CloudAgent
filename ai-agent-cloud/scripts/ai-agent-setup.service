@@ -24,14 +24,11 @@ RemainAfterExit=yes
 WorkingDirectory=/home/ec2-user/CloudAgent/ai-agent-cloud
 ExecStart=/home/ec2-user/CloudAgent/ai-agent-cloud/venv/bin/python \
     /home/ec2-user/CloudAgent/ai-agent-cloud/scripts/instance_alarm_setup.py
+# Restart the alarm worker so it re-reads the patched .env with the new queue URL.
+ExecStartPost=/bin/systemctl restart ai-agent.service
 
-# Surface setup logs in journald under the same unit name.
 StandardOutput=journal
 StandardError=journal
-
-# If setup fails, block the alarm worker from starting with stale config.
-# Remove this line if you prefer the worker to start anyway (with old queue URL).
-SuccessExitStatus=0
 
 [Install]
 WantedBy=multi-user.target

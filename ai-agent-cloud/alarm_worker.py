@@ -351,7 +351,7 @@ def _build_goal(
 
 
 def run_alarm_worker() -> None:
-    load_dotenv()
+    load_dotenv(override=True)
     logger = _configure_logging()
 
     region = os.getenv("AWS_REGION", "us-east-1")

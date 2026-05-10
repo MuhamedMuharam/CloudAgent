@@ -17,6 +17,9 @@ import sys
 import zipfile
 
 import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
 
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 FUNCTION_NAME = "ai-agent-instance-alarm-cleanup"
