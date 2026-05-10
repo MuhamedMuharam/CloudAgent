@@ -1,0 +1,37 @@
+# /etc/systemd/system/ai-agent-setup.service
+#
+# Runs ONCE per boot, before ai-agent.service, to provision the per-instance
+# SQS queue / SNS topic / CloudWatch alarms and patch .env with the queue URL.
+#
+# Install:
+#   sudo cp ai-agent-setup.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable ai-agent-setup.service
+
+[Unit]
+Description=AI Agent per-instance alarm setup
+# Must complete successfully before the alarm worker starts.
+Before=ai-agent.service
+# Run after the network is up (needed for IMDS and boto3 calls).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Stays "active" after exit so ai-agent.service sees it as satisfied.
+RemainAfterExit=yes
+
+WorkingDirectory=/home/ec2-user/CloudAgent/ai-agent-cloud
+ExecStart=/home/ec2-user/CloudAgent/ai-agent-cloud/venv/bin/python \
+    /home/ec2-user/CloudAgent/ai-agent-cloud/scripts/instance_alarm_setup.py
+
+# Surface setup logs in journald under the same unit name.
+StandardOutput=journal
+StandardError=journal
+
+# If setup fails, block the alarm worker from starting with stale config.
+# Remove this line if you prefer the worker to start anyway (with old queue URL).
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
