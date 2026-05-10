@@ -17,6 +17,8 @@ Environment variables (all optional, have defaults):
   AWS_DEFAULT_REGION   - AWS region (default: us-east-1)
   ENV_FILE_PATH        - path to the .env file to patch
                          (default: /home/ec2-user/ai-agent-cloud/.env)
+  AGENT_IAM_USER_ARN   - ARN of the ai-agent IAM user that polls SQS
+                         e.g. arn:aws:iam::123456789012:user/ai-agent
   DISK_DEVICE          - device name for disk alarm dimension
                          (default: nvme0n1p1 for NVMe; set to xvda1 for older HVM)
   DISK_FSTYPE          - filesystem type for disk alarm dimension (default: xfs)
@@ -29,8 +31,11 @@ import re
 import sys
 import urllib.request
 
-# Clear any user-level AWS credentials from the environment so boto3 falls
-# back to the EC2 instance profile (IAM role) instead of the ai-agent IAM user.
+from dotenv import load_dotenv
+
+# Load .env first so AGENT_IAM_USER_ARN and other non-credential vars are available,
+# then clear the AWS credential keys so boto3 uses the EC2 instance profile instead.
+load_dotenv()
 for _var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
     os.environ.pop(_var, None)
 
@@ -39,6 +44,7 @@ from botocore.exceptions import ClientError
 
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 ENV_FILE = os.getenv("ENV_FILE_PATH", "/home/ec2-user/CloudAgent/ai-agent-cloud/.env")
+AGENT_IAM_USER_ARN = os.getenv("AGENT_IAM_USER_ARN", "")
 DISK_DEVICE = os.getenv("DISK_DEVICE", "nvme0n1p1")
 DISK_FSTYPE = os.getenv("DISK_FSTYPE", "xfs")
 DISK_PATH = os.getenv("DISK_PATH", "/")
@@ -93,25 +99,39 @@ def create_sns_topic(sns, name: str) -> str:
 
 
 def wire_sns_to_sqs(sns, sqs, topic_arn: str, queue_arn: str, queue_url: str) -> None:
-    """Subscribe SQS to SNS and set the queue policy to allow SNS delivery."""
+    """Subscribe SQS to SNS and set the queue policy to allow SNS delivery and agent polling."""
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
 
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "AllowSNSPublish",
-                "Effect": "Allow",
-                "Principal": {"Service": "sns.amazonaws.com"},
-                "Action": "sqs:SendMessage",
-                "Resource": queue_arn,
-                "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
-            }
-        ],
-    }
+    statements = [
+        {
+            "Sid": "AllowSNSPublish",
+            "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arn,
+            "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
+        }
+    ]
+
+    if AGENT_IAM_USER_ARN:
+        statements.append({
+            "Sid": "AllowAgentToReceive",
+            "Effect": "Allow",
+            "Principal": {"AWS": AGENT_IAM_USER_ARN},
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+                "sqs:ChangeMessageVisibility",
+            ],
+            "Resource": queue_arn,
+        })
+    else:
+        _log("WARNING: AGENT_IAM_USER_ARN not set — agent will not be able to poll this queue")
+
     sqs.set_queue_attributes(
         QueueUrl=queue_url,
-        Attributes={"Policy": json.dumps(policy)},
+        Attributes={"Policy": json.dumps({"Version": "2012-10-17", "Statement": statements})},
     )
 
 
