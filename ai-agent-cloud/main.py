@@ -12,7 +12,7 @@ Purpose:
 How It Works:
 1. Define a goal in natural language (e.g., "Create 1 VM")
 2. Call run_agent_sync(goal) from agent/core.py
-3. Agent uses GPT-4 + MCP to accomplish the goal
+3. Agent uses the configured LLM + MCP to accomplish the goal
 4. State is tracked in state/ directory
 
 Usage:
@@ -30,15 +30,9 @@ After Running:
 - View logs: python view_state.py --log
 - Sync AWS: python sync_aws_state.py
 
-Example Goals:
-- "List all EC2 instances"
-- "Create 1 t3.micro instance for web server"
-- "Ensure I have exactly 2 running instances"
-- "Delete all stopped instances"
-
 Configuration Required:
 - .env file with AWS credentials (see .env.example)
-- OpenAI API key for GPT-4
+- LLM API key (OpenAI or Anthropic, see .env.example)
 """
 
 from agent.core import run_agent_sync
@@ -46,7 +40,7 @@ from agent.core import run_agent_sync
 if __name__ == "__main__":
     # Print banner and helpful information
     print("=" * 60)
-    print("AI Agent Cloud Infrastructure - MCP Demo")
+    print("AI Agent Cloud Infrastructure - MCP")
     print("=" * 60)
     print()
     print("💡 Tip: Before first run, capture baseline state:")
@@ -65,8 +59,8 @@ if __name__ == "__main__":
     # It will then call MCP tools (via AWS server) to take actions
  
     goal = """
-    resize now the instance named ASG-instance to be t3.medium instead of t3.micro.
-"""
+    Investigate instance named TestWebServer. Check alarms, metrics, and logs. Give me its current state
+   """
     # You can also test other goals:
     # detect idle cost leaks in my AWS account and recommend actions to fix them.
     # Analyze and apply rightsizing action(if needed) for instance named SrcInstance and recommend savings.

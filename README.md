@@ -363,6 +363,7 @@ Full reference is in `.env.example`. The most important variables for a fresh de
 | `ALARM_SQS_QUEUE_URL`    | auto-patched by `instance_alarm_setup.py` | SQS queue URL for the alarm worker                          |
 | `COST_OPTIMIZATION_MODE` | `.env`                                    | `recommend_only` (safe default) or `take_action`            |
 | `HITL_ENABLED`           | `.env`                                    | `true` to require human approval before destructive actions |
+| `HITL_EMAIL_TO`          | `.env`                                    | **Mandatory when `HITL_ENABLED=true`** — email address that receives approve/deny requests; leaving this blank means approval emails are never sent and the agent will auto-deny after timeout |
 
 ---
 

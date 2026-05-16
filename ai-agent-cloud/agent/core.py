@@ -6,7 +6,7 @@ This module orchestrates the entire agent workflow:
 1. Load environment variables (API keys, AWS credentials)
 2. Connect to MCP servers (spawn aws_server.py as subprocess)
 3. Discover available tools from MCP servers
-4. Run agent loop: GPT-4 plans → calls tools → evaluates results
+4. Run agent loop: LLM plans → calls tools → evaluates results
 5. Log actions to state files for audit trail
 """
 
@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 from dotenv import load_dotenv  # Load .env file with credentials
+from hitl import should_gate, request_human_approval
 from .llm_provider import LLMProvider, create_provider
 from .mcp_client import MCPClientManager  # MCP client (connects to servers)
 from .state_manager import StateManager  # State tracking and audit logs
@@ -93,27 +94,31 @@ MUTATING_TOOLS: frozenset = frozenset({
     "aws_set_launch_template_default_version",
     "aws_put_asg_scaling_policy",
     "aws_delete_asg_scaling_policy",
-    # SSM execution (remote commands)
+    # SSM execution (remote commands and service control)
     "aws_ssm_run_command",
+    "aws_ssm_start_service",
+    "aws_ssm_stop_service",
     "aws_ssm_restart_service",
     "aws_ssm_safe_disk_cleanup",
     # CloudWatch mutations
-    "aws_create_cloudwatch_alarm",
-    "aws_delete_cloudwatch_alarm",
-    "aws_create_cloudwatch_dashboard",
+    "aws_create_metric_alarm",
     # Security group mutations
+    "aws_create_security_group",
+    "aws_delete_security_group",
+    "aws_add_security_group_rule",
     "aws_edit_security_group_rule",
-    "aws_create_security_group_rule",
-    "aws_delete_security_group_rule",
+    "aws_remove_security_group_rule",
     # Networking
     "aws_create_vpc",
     "aws_delete_vpc",
     "aws_create_subnet",
+    "aws_delete_subnet",
     "aws_create_internet_gateway",
-    "aws_attach_internet_gateway",
+    "aws_delete_internet_gateway",
     "aws_create_nat_gateway",
+    "aws_delete_nat_gateway",
     "aws_create_route_table",
-    "aws_create_route",
+    "aws_delete_route_table",
     "aws_associate_route_table",
 })
 
@@ -772,7 +777,6 @@ async def run_agent(goal: str, mcp_servers: list = None):
 
                         # STEP 1.5: Human-in-the-loop gate for risky actions
                         if os.getenv("HITL_ENABLED", "true").lower() == "true":
-                            from hitl import should_gate, request_human_approval
                             gate, risk_reason = should_gate(tool_name, args)
                             if gate:
                                 hitl_timeout = int(os.getenv("HITL_APPROVAL_TIMEOUT_SECONDS", "300"))
@@ -861,7 +865,7 @@ async def run_agent(goal: str, mcp_servers: list = None):
                                         resource_type="ec2_instance",
                                         resource_id=args.get("instance_id", "unknown")
                                     )
-                        except:
+                        except Exception:
                             print(f"   {result}")
                         
                         # Add tool result to conversation

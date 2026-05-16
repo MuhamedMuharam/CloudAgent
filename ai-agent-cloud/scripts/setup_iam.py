@@ -62,6 +62,28 @@ def setup_iam_user(iam, account_id: str, region: str) -> None:
         iam.attach_user_policy(UserName=USER_NAME, PolicyArn=arn)
         print(f"    Attached: {arn.split('/')[-1]}")
 
+    print("==> Putting inline policy: AIAgent-ASG-LaunchTemplate-PassRole")
+    iam.put_user_policy(
+        UserName=USER_NAME,
+        PolicyName="AIAgent-ASG-LaunchTemplate-PassRole",
+        PolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowPassOnlySpecificEc2InstanceRoles",
+                    "Effect": "Allow",
+                    "Action": "iam:PassRole",
+                    "Resource": f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:PassedToService": "ec2.amazonaws.com"
+                        }
+                    },
+                }
+            ],
+        }),
+    )
+
     print("==> Putting inline policy: AllowAgentToRunSSMCommands")
     iam.put_user_policy(
         UserName=USER_NAME,
