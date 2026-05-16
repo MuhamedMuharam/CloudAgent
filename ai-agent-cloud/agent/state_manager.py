@@ -4,7 +4,7 @@ State Manager - Persistent State Tracking for AI Agent
 
 PURPOSE:
 This module provides persistent storage and audit logging for the AI agent's actions.
-Essential for thesis evaluation - provides complete audit trail of agent decisions.
+Provides a complete audit trail of agent decisions and infrastructure changes.
 
 TWO MAIN FILES:
 1. state.json - Current infrastructure snapshot (latest state)
@@ -12,7 +12,6 @@ TWO MAIN FILES:
 
 WHY WE NEED THIS:
 - Track what the agent does over time
-- Audit trail for thesis evaluation
 - Recover from crashes (agent can resume from last state)
 - Debugging (see what went wrong)
 - Cost monitoring (track resource creation)
@@ -52,10 +51,10 @@ class StateManager:
        - Never modified, only appended
        - Used for audit trail and debugging
        - Each line: {"timestamp": "...", "action": "...", "args": {...}, "result": "..."}
-    
+
     WHY TWO FILES?
     - state.json = fast lookup of current state
-    - audit_log.jsonl = complete history for thesis evaluation
+    - audit_log.jsonl = complete history for audit and analysis
     - Separate concerns: current state vs historical actions
     
     THREAD SAFETY:
@@ -132,7 +131,7 @@ class StateManager:
         
         Purpose:
         - Ensures state file always has valid structure
-        - Tracks metrics for thesis evaluation
+        - Tracks operational metrics
         - Multi-cloud ready (AWS, Azure, GCP sections)
         """
         initial_state = {
@@ -161,10 +160,10 @@ class StateManager:
                 }
             },
             "statistics": {
-                # Metrics for thesis evaluation
-                "total_goals_executed": 0,  # How many goals agent completed
-                "total_resources_created": 0,  # Total resources created
-                "total_resources_deleted": 0,  # Total resources destroyed
+                # Operational metrics
+                "total_goals_executed": 0,
+                "total_resources_created": 0,
+                "total_resources_deleted": 0,
                 "cost_recommendations_generated": 0,
                 "cost_actions_applied": 0,
                 "estimated_hourly_savings_usd": 0.0,
@@ -343,13 +342,10 @@ class StateManager:
         """
         Log an action to the audit log (audit_log.jsonl).
         
-        THIS IS THE MOST IMPORTANT METHOD FOR THESIS EVALUATION!
-        
         Purpose:
         - Creates append-only audit trail
         - Every action the agent takes is logged
-        - Provides complete history for evaluation
-        - Enables debugging and analysis
+        - Enables debugging and post-hoc analysis
         
         Args:
             action_type: Type of action (e.g., 'aws_create_ec2_instance', 'goal_executed')

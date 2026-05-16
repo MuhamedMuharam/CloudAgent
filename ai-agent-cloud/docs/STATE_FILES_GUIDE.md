@@ -1,7 +1,7 @@
 # State Files Guide
 
 ## Overview
-The AI Agent uses persistent state tracking to maintain audit trails and infrastructure snapshots. This is crucial for your bachelor thesis evaluation.
+The AI Agent uses persistent state tracking to maintain audit trails and infrastructure snapshots.
 
 ## State Files Location
 All state files are stored in: `state/`
@@ -82,8 +82,7 @@ All state files are stored in: `state/`
 - Every resource deletion (via tool calls)
 
 **Use Cases:**
-- Full audit trail for thesis evaluation: `python view_state.py --log`
-- Prove autonomous decision-making
+- Full audit trail: `python view_state.py --log`
 - Debug agent behavior
 - Show timeline of infrastructure changes
 
@@ -138,28 +137,26 @@ python view_state.py --sync
 
 ---
 
-## 🎓 Thesis Benefits
+## Operational Benefits
 
 ### 1. Autonomous Decision Tracking
-- `audit_log.jsonl` proves agent made decisions independently
-- Shows which tools were called and when
-- Documents reasoning through goals executed
+- `audit_log.jsonl` records every tool call the agent made, including arguments and outcome
+- Enables post-hoc debugging and root-cause analysis
 
 ### 2. Infrastructure State Management
-- `state.json` shows "desired state" vs actual AWS state
-- Demonstrates infrastructure-as-code principles
-- Tracks drift detection capability
+- `state.json` provides a fast-lookup snapshot of current infrastructure organized as VPCs → Subnets → Instances + Security Groups
+- Tracks drift detection between expected and actual AWS state
 
-### 3. Evaluation Metrics
+### 3. Statistics and Cost Tracking
 From `state.json` → `statistics`:
-- **Goals executed:** How many high-level tasks completed
-- **Resources created:** Infrastructure provisioned by agent
-- **Resources deleted:** Cleanup operations performed
+- **Goals executed:** Count of high-level tasks completed
+- **Resources created/deleted:** Infrastructure provisioned or cleaned up by the agent
+- **Cost recommendations generated / actions applied:** Rightsizing activity counters
+- **Estimated savings:** Accumulated hourly and monthly savings from applied resizes
 
 ### 4. Reproducibility
-- Audit log allows replaying agent decisions
+- Audit log allows replaying agent decisions chronologically
 - State snapshots enable before/after comparisons
-- Timestamps prove chronological ordering
 
 ---
 

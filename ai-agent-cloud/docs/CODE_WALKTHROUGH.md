@@ -1,7 +1,6 @@
-﻿# Complete Code Walkthrough (Current Architecture)
+# Code Walkthrough
 
-This document is a current, code-aligned walkthrough of the project architecture.
-It is intended as a technical reference for implementation understanding and thesis writing.
+This document is a code-aligned walkthrough of the project architecture, intended as a technical reference for understanding implementation decisions and system design.
 
 ## 1. Project Purpose
 
@@ -13,30 +12,50 @@ This repository implements an autonomous cloud operations agent that:
 4. Applies policy checks before execution.
 5. Persists state and an audit trail for traceability.
 6. Supports observability-driven operations with CloudWatch, X-Ray, and SSM.
-
-In addition, the project includes a deployable FastAPI + Celery reference workload used to generate realistic logs, metrics, and traces for incident simulation and root-cause analysis.
+7. Continuously monitors infrastructure via an event-driven alarm worker.
+8. Performs weekly cost optimization analysis via a containerized ECS Fargate worker.
 
 ## 2. Repository Structure
 
 High-level modules and responsibilities:
 
-1. `main.py`: Interactive entry point for goal-driven agent execution.
-2. `agent/`: Core orchestration logic.
-3. `mcp_servers/`: MCP server implementations (AWS fully implemented).
-4. `cloud_providers/aws/`: AWS manager classes wrapping boto3 APIs.
-5. `alarm_worker.py`: Event-driven worker that polls SQS alarm notifications and triggers agent triage.
-6. `config/observability/`: CloudWatch agent config for log and metric collection.
-8. `state/`: Persistent snapshot (`state.json`) and append-only action log (`audit_log.jsonl`).
-9. `policies/`: YAML policy constraints enforced before tool execution.
-10. `docs/`: Operational and architecture documentation.
+| Module | Responsibility |
+|--------|---------------|
+| `main.py` | Interactive entry point for goal-driven agent execution |
+| `alarm_worker.py` | Long-running SQS polling loop; triggers agent triage on CloudWatch alarms |
+| `cost_optimization_worker.py` | One-shot weekly **vertical** rightsizing analysis (instance type, not fleet size); runs as ECS Fargate task |
+| `agent/` | Core orchestration: LLM loop, MCP client, policy engine, state manager, observability helper, LLM provider abstraction |
+| `mcp_servers/aws_server.py` | FastMCP server exposing 71 boto3-backed tools over stdio |
+| `cloud_providers/aws/` | Manager classes wrapping boto3 APIs (EC2, VPC, CloudWatch, SSM, X-Ray, ASG, mapping) |
+| `scripts/` | Bootstrap and deployment scripts (IAM, ECS, Lambda, EC2 setup) |
+| `config/` | CloudWatch agent config, cost worker environment file |
+| `state/` | Persistent snapshot (`state.json`) and append-only action log (`audit_log.jsonl`) |
+| `policies/aws_policies.yaml` | YAML policy constraints enforced before every tool execution |
+| `docs/` | Operational and architecture documentation |
 
-## 3. Python Package Initialization (`__init__.py`)
+## 3. LLM Provider Abstraction (`agent/llm_provider.py`)
 
-`__init__.py` files define package boundaries and convenient exports.
+The agent supports multiple LLM backends through a provider abstraction layer. The active provider is selected at startup via the `LLM_PROVIDER` environment variable.
+
+```
+LLM_PROVIDER=openai    → OpenAIProvider  (needs OPENAI_API_KEY)
+LLM_PROVIDER=anthropic → AnthropicProvider (needs ANTHROPIC_API_KEY)
+```
+
+Key design decisions:
+
+1. All providers expose the same `chat()` interface, returning a normalized `LLMResponse` with `content`, `tool_calls`, and `_raw` (provider-native object).
+2. Tool schemas are defined once in OpenAI format; `AnthropicProvider._openai_tools_to_anthropic()` converts them transparently at call time.
+3. Message history is stored in OpenAI-format dicts; `_to_anthropic_messages()` converts per-call without modifying stored history.
+4. Adding a new provider requires only implementing `LLMProvider` and registering it in `create_provider()`.
+
+The main controller model and observability helper model are independently configurable (`MAIN_CONTROLLER_MODEL`, `OBSERVABILITY_HELPER_MODEL`).
+
+## 4. Python Package Initialization (`__init__.py`)
 
 ### `cloud_providers/aws/__init__.py`
 
-Exports current AWS managers and helpers:
+Exports current AWS managers:
 
 1. `EC2Manager`
 2. `VPCManager`
@@ -44,7 +63,8 @@ Exports current AWS managers and helpers:
 4. `CloudWatchManager`
 5. `SSMManager`
 6. `XRayManager`
-7. `map_generic_to_instance_type`
+7. `ASGManager`
+8. `map_generic_to_instance_type`
 
 ### `agent/__init__.py`
 
@@ -53,7 +73,7 @@ Exports key agent entry symbols:
 1. `run_agent`
 2. `StateManager`
 
-## 4. MCP Architecture (Current)
+## 5. MCP Architecture
 
 The implementation uses two complementary libraries:
 
@@ -62,217 +82,282 @@ The implementation uses two complementary libraries:
 
 Communication pattern:
 
-1. Agent process spawns AWS MCP server as a subprocess.
+1. Agent process spawns the AWS MCP server as a subprocess.
 2. Client and server communicate over stdio using JSON-RPC (MCP protocol).
-3. Agent discovers tools, resources, resource templates, and prompts.
-4. LLM chooses tool calls; client routes calls to the owning MCP server.
+3. Agent discovers tools at startup; the tool list is dynamic.
+4. The LLM chooses tool calls; the client routes them to the owning MCP server.
 
-Design consequence: the planner (`agent/core.py`) is decoupled from boto3 implementation details.
+The planner (`agent/core.py`) is fully decoupled from boto3 implementation details. MCP resources and prompts are no longer used — all context is injected via goal-aware system prompt instruction packs.
 
-## 5. Execution Flow A: Interactive Goal (`python main.py`)
+## 6. Execution Flow A: Interactive Goal (`python main.py`)
 
 ### Step-by-step sequence
 
 1. `main.py` defines a goal and calls `run_agent_sync(goal)`.
 2. `agent/core.py` initializes:
-   - OpenAI client
-   - MCPClientManager
-   - StateManager
-   - PolicyEngine
-3. Core connects to MCP servers (default AWS server subprocess).
-4. MCP client discovers capabilities:
-   - tools
-   - resources
-   - resource templates
-   - prompts
-5. System prompt is built via goal-aware instruction packs.
-6. Agent loop starts:
-   - LLM returns either tool calls or final response
-   - Before executing each tool: `PolicyEngine.validate_action(...)`
-   - Tool executes through MCP server
-   - Tool result is appended to conversation and logged
-7. Loop exits on final assistant response or max iterations.
-8. Core closes MCP sessions/subprocesses and writes final goal execution log.
+   - LLM provider (via `create_provider(LLM_PROVIDER, MAIN_CONTROLLER_MODEL)`)
+   - `MCPClientManager`
+   - `StateManager`
+   - `PolicyEngine`
+3. Core connects to MCP servers (spawns `aws_server.py` as a child process over stdio).
+4. MCP client discovers the 71 available tools.
+5. System prompt is built via `build_system_prompt(goal)`:
+   - Base rules are always included.
+   - Instruction packs are selected based on keywords detected in the goal (e.g. `asg_scaling` pack injected if goal mentions "auto scaling", "scale out").
+   - Policy domain hints are appended; full YAML sections are injected only when a relevant tool is about to be called.
+6. `delegate_observability_analysis` is registered as a synthetic tool alongside the MCP tools.
+7. Agent loop starts:
+   - LLM returns either tool calls or a final response.
+   - Mutating tools are checked against `MUTATING_TOOLS` frozenset.
+   - Before executing each tool: `PolicyEngine.validate_action(tool_name, args, relevant_domains)`.
+   - Tool executes through the MCP server.
+   - Tool result is appended to conversation and logged via `StateManager`.
+8. If `delegate_observability_analysis` is called, `run_observability_helper(analysis_request)` is invoked — a separate LLM instance with only CloudWatch/X-Ray/SSM tools, preventing telemetry payloads from bloating the main context.
+9. Loop exits on final assistant response or `max_iterations`.
+10. Core closes MCP sessions/subprocesses and writes the final goal execution log.
 
-### Important implementation notes
+### Goal-aware instruction packs
 
-1. Tool routing is dynamic via `tool_server_mapping`.
-2. Synthetic helper tools are added for MCP non-tool capabilities:
-   - `read_mcp_resource`
-   - `get_mcp_prompt`
-3. Pre-router in `agent/core.py` can preload explicitly requested resources/prompts before first model turn.
+`INSTRUCTION_PACKS` in `agent/core.py` contains focused guidance for each operational domain. Packs are injected into the system prompt only when their keywords appear in the goal, keeping token usage low for simple goals.
 
-## 6. Execution Flow B: Alarm-Driven Worker (`python alarm_worker.py`)
+| Pack key | Injected when goal contains |
+|---|---|
+| `security_groups` | "security group", "ingress", "cidr", "port" |
+| `vpc_deletion` | "vpc", "delete", "remove" |
+| `cloudwatch_alarms` | "alarm", "cloudwatch", "metrics", "logs" |
+| `ssm_execution` | "ssm", "command", "service", "systemctl" |
+| `xray_tracing` | "xray", "trace", "service graph" |
+| `cost_optimization` | "cost", "rightsize", "resize", "savings" |
+| `asg_scaling` | "asg", "auto scaling", "scale out", "launch template" |
+
+## 7. Execution Flow B: Alarm Worker (`python alarm_worker.py`)
 
 `alarm_worker.py` is a continuously running triage loop:
 
-1. Polls SQS for alarm notifications via `CloudWatchManager.poll_alarm_notifications`.
-2. Parses SNS-wrapped CloudWatch alarm payload.
-3. Extracts alarm context (name, state, reason, InstanceId dimension if present).
-4. Builds a targeted triage goal.
-5. Calls `run_agent_sync(goal)` to perform automated diagnosis.
-6. Acknowledges/deletes message on successful processing.
-7. Leaves message unacked on failure (reappears after visibility timeout).
+1. Polls the per-instance SQS queue for CloudWatch alarm notifications via `CloudWatchManager.poll_alarm_notifications`.
+2. Optionally filters to ALARM-state only (controlled by `ALARM_WORKER_PROCESS_ONLY_ALARM`).
+3. Classifies the alarm into a family: `cpu_pressure`, `disk_pressure`, `memory_pressure`, `ec2_system_status`, `ec2_instance_status`, `application_error`, `generic_alarm`.
+4. Builds a targeted triage goal via `_build_goal()`, including alarm context, execution mode, OS hint, and allowed service restarts.
+5. Delegates heavy telemetry analysis to the observability helper via a base seed in `analysis_request`.
+6. Calls `run_agent_sync(goal)` for automated diagnosis and (if configured) mitigation.
+7. Acknowledges/deletes the SQS message on successful processing; leaves it unacked on failure so it reappears after the visibility timeout.
 
-This turns CloudWatch alarms into event-triggered autonomous response actions.
+See `docs/AlarmWorkerGuide.md` for the full environment variable reference and log event dictionary.
 
-## 7. Current AWS MCP Surface (Server Capabilities)
+## 8. Execution Flow C: Cost Optimization Worker (`python cost_optimization_worker.py`)
 
-The AWS MCP server currently exposes:
+`cost_optimization_worker.py` is a one-shot **vertical cost optimization** process triggered weekly by EventBridge Scheduler on ECS Fargate. It optimizes the instance type of each EC2 instance (rightsizing) rather than changing fleet size:
 
-1. 47 tools (`@mcp.tool()`)
-2. 3 resources (`@mcp.resource(...)`)
-3. 2 prompt templates (`@mcp.prompt()`)
+1. Reads configuration from `config/cost_optimization/cost-optimization.worker.env`.
+2. Queries CloudWatch metrics for all in-scope EC2 instances (CPU, memory, disk, network) over the configured analysis window.
+3. Evaluates each instance against idle/hot thresholds and safety gates (peak CPU cap, minimum savings, minimum data hours).
+4. In `recommend_only` mode: logs recommendations to CloudWatch (`/ecs/cost-optimization-worker`) and S3.
+5. In `take_action` mode: for each qualifying instance, optionally creates an AMI backup, stops the instance, resizes it, restarts it, and calls `aws_sync_asg_launch_template_after_resize` to propagate the new instance type to the ASG launch template.
 
-### Tool groups
+See `docs/CostOptimizationServiceGuide.md` for deployment details.
 
-1. EC2 lifecycle and status
-   - list/create/delete/get status/start/stop/reboot
-   - SSM managed-instance status check
-2. SSM remote execution and service control
-   - run command, get output
-   - start/stop/restart/status/list services
-3. X-Ray tracing
-   - trace summaries
-   - trace details
-   - service graph
-4. CloudWatch observability
-   - EC2 and agent metrics
-   - log groups/streams/events/filter
-   - alarms list and EC2-specific alarm listing
-   - SQS alarm notification poll/delete
-   - create metric alarm
-   - get dashboard
-5. VPC networking
-   - create/list/get/delete VPC
-   - create/delete subnet, IGW, NAT gateway, route table
-   - associate route tables, list route tables
-6. Security groups
-   - create SG
-   - add SG rule
-   - list SGs
-   - delete SG
+## 9. AWS MCP Tool Surface (71 tools)
 
-### Resources
+The AWS MCP server currently exposes 71 tools across 7 groups. There are no MCP resources or prompts — all context is delivered via the system prompt.
 
-1. `aws://observability/snapshot`
-2. `aws://observability/ec2/{instance_id}/snapshot`
-3. `aws://observability/log-group/{log_group_name}/snapshot`
+### EC2 Lifecycle and Status (9)
 
-### Prompts
+| Tool | Action |
+|------|--------|
+| `aws_list_ec2_instances` | List instances with optional tag filter |
+| `aws_create_ec2_instance` | Launch a new instance |
+| `aws_delete_ec2_instance` | Terminate an instance |
+| `aws_get_ec2_instance_status` | Get instance state and health |
+| `aws_start_ec2_instance` | Start a stopped instance |
+| `aws_stop_ec2_instance` | Stop a running instance |
+| `aws_reboot_ec2_instance` | Reboot an instance |
+| `aws_get_ec2_instance_ssm_status` | Check SSM agent reachability |
+| `aws_collect_ec2_health_snapshot` | Collect combined status/metrics/alarm snapshot |
 
-1. `aws_incident_triage_prompt`
-2. `aws_observability_snapshot_interpreter_prompt`
+### SSM Remote Execution and Service Control (9)
 
-## 8. Policy Enforcement Model
+| Tool | Action |
+|------|--------|
+| `aws_ssm_run_command` | Execute a shell command on an instance |
+| `aws_ssm_get_command_output` | Fetch output from a previously submitted command |
+| `aws_ssm_collect_host_diagnostics` | Run a suite of host diagnostics (disk, memory, processes, logs) |
+| `aws_ssm_safe_disk_cleanup` | Identify and optionally remove large/tmp files |
+| `aws_ssm_start_service` | Start a systemd service |
+| `aws_ssm_stop_service` | Stop a systemd service |
+| `aws_ssm_restart_service` | Restart a systemd service |
+| `aws_ssm_get_service_status` | Get systemd service status |
+| `aws_ssm_list_running_services` | List all active systemd services |
+
+### Cost Optimization and Rightsizing (6)
+
+| Tool | Action |
+|------|--------|
+| `aws_analyze_ec2_cost_optimization` | Analyze a single instance for rightsizing |
+| `aws_analyze_ec2_fleet_cost_optimization` | Analyze the entire fleet |
+| `aws_get_compute_optimizer_recommendations` | Fetch AWS Compute Optimizer recommendations |
+| `aws_resize_ec2_instance` | Validate or perform a type change (dry_run supported) |
+| `aws_apply_ec2_rightsizing` | Execute a validated resize with backup and continuity checks |
+| `aws_detect_idle_cost_leaks` | Identify stopped/idle resources wasting spend |
+
+### ASG and Launch Template (12)
+
+| Tool | Action |
+|------|--------|
+| `aws_list_launch_templates` | List launch templates |
+| `aws_describe_launch_template` | Get LT details and selected versions |
+| `aws_create_launch_template_version` | Create a new LT version overriding instance type |
+| `aws_set_launch_template_default_version` | Change the default version |
+| `aws_list_asgs` | List Auto Scaling Groups |
+| `aws_describe_asg` | Get full ASG details including instances |
+| `aws_get_instance_asg` | Check if an instance belongs to an ASG |
+| `aws_update_asg_launch_template` | Update ASG's launch template reference |
+| `aws_sync_asg_launch_template_after_resize` | Compound call: create new LT version + update ASG after a vertical resize |
+| `aws_put_asg_scaling_policy` | Create or update a scaling policy (Target Tracking, Step, Simple) |
+| `aws_describe_asg_scaling_policies` | List scaling policies for an ASG |
+| `aws_delete_asg_scaling_policy` | Remove a scaling policy |
+
+### X-Ray Tracing (3)
+
+| Tool | Action |
+|------|--------|
+| `aws_get_xray_trace_summaries` | Fetch trace summaries for a time window |
+| `aws_get_xray_trace_details` | Fetch full segment data for specific trace IDs |
+| `aws_get_xray_service_graph` | Get the service dependency graph |
+
+### CloudWatch Observability (12)
+
+| Tool | Action |
+|------|--------|
+| `aws_get_ec2_metrics` | Fetch EC2 metrics (CPU, network, disk) |
+| `aws_get_ec2_metrics_scoped` | Fetch metrics with adaptive period resolution |
+| `aws_list_log_groups` | List log groups with optional prefix filter |
+| `aws_list_log_streams` | List streams within a log group |
+| `aws_get_log_events` | Get raw log events from a stream |
+| `aws_filter_logs` | Filter-pattern search across a log group |
+| `aws_list_alarms` | List all CloudWatch alarms |
+| `aws_list_ec2_alarms` | List alarms for a specific instance |
+| `aws_poll_alarm_notifications` | Pull alarm notifications from an SQS queue |
+| `aws_delete_alarm_notification` | Delete (acknowledge) an SQS alarm message |
+| `aws_create_metric_alarm` | Create or update a CloudWatch alarm |
+| `aws_get_dashboard` | Get a CloudWatch dashboard |
+
+### VPC Networking (14)
+
+| Tool | Action |
+|------|--------|
+| `aws_create_vpc` / `aws_delete_vpc` | Create or delete a VPC (force-deletes dependents) |
+| `aws_list_vpcs` / `aws_get_vpc_details` | List or inspect VPCs |
+| `aws_create_subnet` / `aws_delete_subnet` | Create or delete a subnet |
+| `aws_create_internet_gateway` / `aws_delete_internet_gateway` | Create or delete an IGW |
+| `aws_create_nat_gateway` / `aws_delete_nat_gateway` | Create or delete a NAT gateway |
+| `aws_create_route_table` / `aws_delete_route_table` | Create or delete a route table |
+| `aws_associate_route_table` | Associate a route table with a subnet |
+| `aws_list_route_tables` | List route tables for a VPC |
+
+### Security Groups (6)
+
+| Tool | Action |
+|------|--------|
+| `aws_create_security_group` | Create a new security group |
+| `aws_add_security_group_rule` | Add an ingress or egress rule |
+| `aws_edit_security_group_rule` | Modify an existing rule |
+| `aws_remove_security_group_rule` | Remove a rule |
+| `aws_list_security_groups` | List security groups with optional filters |
+| `aws_delete_security_group` | Delete a security group |
+
+## 10. Policy Enforcement Model
 
 `agent/policy_engine.py` validates selected actions before execution. Policy definitions live in `policies/aws_policies.yaml`.
 
-Current enforced validators include:
+Policy sections:
 
-1. EC2 creation constraints (CPU/RAM limits).
-2. VPC CIDR restrictions and prefix validation.
-3. Security group creation/rule checks.
-4. NAT gateway creation awareness.
+| Section | What it enforces |
+|---------|-----------------|
+| `ec2` | Instance creation constraints (CPU/RAM limits, allowed families) |
+| `vpc` | CIDR block restrictions and prefix length validation |
+| `security_groups` | Rule creation and CIDR validation |
+| `ssm` | Blocked commands (rm -rf, shutdown, mkfs, etc.) and OS-safe command sets |
+| `nat_gateway` | Creation awareness (cost warning) |
+| `general` | Cross-cutting limits (max instances, tagging requirements) |
+| `cost_optimization` | Resize guardrails (minimum savings, backup requirements) |
 
-Current policy sections in YAML:
+Policy injection is lazy: the system prompt contains only a discovery hint on startup. Full YAML sections are injected into the conversation only when the goal or an imminent tool call touches the relevant domain.
 
-1. `ec2`
-2. `vpc`
-3. `security_groups`
-4. `nat_gateway`
-5. `general`
-
-## 9. State and Audit Persistence
+## 11. State and Audit Persistence
 
 `agent/state_manager.py` uses a two-tier persistence model:
 
-1. Snapshot state (`state/state.json`)
-   - current infrastructure representation
-   - hierarchical AWS organization (VPCs, subnets, instances, SGs)
-2. Append-only audit log (`state/audit_log.jsonl`)
-   - every action/goal execution over time
-   - supports traceability and post-hoc analysis
+1. **Snapshot state** (`state/state.json`)
+   - Current infrastructure representation
+   - Hierarchical organization: VPCs → Subnets → Instances + Security Groups
+   - Statistics counters: goals executed, resources created/deleted, cost savings
+2. **Append-only audit log** (`state/audit_log.jsonl`)
+   - One JSON object per line; never modified, only appended
+   - Records every tool invocation, goal completion, and cost action
+   - Survives crashes (partial writes don't corrupt previous lines)
 
 Utilities:
 
-1. `sync_aws_state.py`: pull live AWS resources and rewrite state snapshot.
-2. `view_state.py`: report statistics/logs and optional sync.
+- `sync_aws_state.py` — pulls live AWS resources and rewrites the state snapshot.
+- `view_state.py` — prints statistics, infrastructure tree, and recent audit log entries.
 
-## 10. Observability and Log-Group Semantics
+## 12. Observability and Log-Group Semantics
 
-Current CloudWatch log mapping (from `config/observability/amazon-cloudwatch-agent.json`):
+CloudWatch log group mapping (from `config/observability/amazon-cloudwatch-agent.json`):
 
-1. `/var/log/ai-agent/agent.log` -> `/ai-agent/agent`
-2. `/var/log/messages` -> `/ai-agent/system`
-3. `/var/log/mern-app/api.log` -> `/mern-app/api`
+| Local path | CloudWatch log group | Contents |
+|---|---|---|
+| `/var/log/ai-agent/agent.log` | `/ai-agent/agent` | Alarm worker polling, agent orchestration, decision logs |
+| `/var/log/messages` | `/ai-agent/system` | Host, systemd, OS-level events |
+| *(ECS task stdout)* | `/ecs/cost-optimization-worker` | Cost worker analysis and action logs |
+| *(Lambda stdout)* | `/aws/lambda/ai-agent-instance-alarm-cleanup` | Per-instance cleanup events on EC2 termination |
 
-Operational interpretation:
-
-1. `/ai-agent/agent`: alarm_worker polling, agent orchestration, and decision logs.
-2. `/ai-agent/system`: host, systemd, OS-level events.
-3. `/mern-app/api`: MERN application request and error logs (Express, MongoDB, Node.js).
-
-`agent/core.py` and `agent/observability_helper.py` instruction packs include this log-group routing guidance for incident triage.
-
-## 12. Deployment and Runtime Path Reality
-
-A common operational pitfall is source location mismatch:
-
-1. Git repository code lives under repo root.
-2. Deployed systemd services run from `/opt/real-service/src`.
-
-Therefore, after `git pull`, code changes are not active until synced to `/opt/real-service/src` and services are restarted.
-
-This is captured in `docs/FastApiServiceGuide.md` under update workflow.
+The observability helper's instruction pack and the alarm worker's `_build_goal()` both reference these log group names explicitly so the agent searches the right groups during incident triage.
 
 ## 13. Environment Variables (Key Runtime Controls)
 
 ### Global agent and AWS
 
-1. `OPENAI_API_KEY`
-2. `AWS_REGION`
-3. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (or `AWS_PROFILE`)
-
-### Optional CloudWatch defaults
-
-1. `CW_DASHBOARD_NAME`
-2. `CW_TEST_LOG_GROUP`
-3. `CW_TEST_INSTANCE_ID`
-4. `CW_TEST_SNS_ARN`
+| Variable | Purpose |
+|---|---|
+| `LLM_PROVIDER` | `openai` (default) or `anthropic` |
+| `MAIN_CONTROLLER_MODEL` | Model for the main agent loop |
+| `OBSERVABILITY_HELPER_MODEL` | Model for the observability sub-agent |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Credentials for the chosen provider |
+| `AWS_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials (or `AWS_PROFILE`) |
 
 ### Alarm worker
 
-1. `ALARM_SQS_QUEUE_URL`
-2. `ALARM_TARGET_INSTANCE_NAME`
-3. `ALARM_WORKER_LOG_LEVEL`
-4. `ALARM_WORKER_MAX_MESSAGES`
-5. `ALARM_WORKER_WAIT_TIME_SECONDS`
-6. `ALARM_WORKER_VISIBILITY_TIMEOUT`
-7. `ALARM_WORKER_LOOP_SLEEP_SECONDS`
-8. `ALARM_WORKER_PROCESS_ONLY_ALARM`
+| Variable | Purpose |
+|---|---|
+| `ALARM_SQS_QUEUE_URL` | SQS queue to poll (auto-written by `instance_alarm_setup.py`) |
+| `ALARM_WORKER_AUTO_MITIGATE` | `true` = execute safe mitigations; `false` = recommend only |
+| `ALARM_WORKER_PROCESS_ONLY_ALARM` | Skip OK/INSUFFICIENT_DATA messages |
+| `ALARM_WORKER_REQUIRE_SUCCESS_FOR_ACK` | Only delete SQS message on agent success |
+| `ALARM_WORKER_ALLOW_REBOOT_ON_STATUS_CHECK_FAILURE` | Permit autonomous reboots |
+| `ALARM_WORKER_RESTART_SERVICES` | Comma-separated service names allowed for auto-restart |
 
-## 14. What Changed Compared to Older Walkthrough Versions
+Full reference: `docs/AlarmWorkerGuide.md`.
 
-Previous walkthrough versions commonly reflected an early EC2-only MCP server.
-Current implementation has evolved to a full observability and operations platform with:
+### Cost optimization worker
 
-1. SSM command and host service management.
-2. CloudWatch metrics/logs/alarms + SQS alarm polling.
-3. X-Ray trace analysis and service graph tooling.
-4. VPC and security group lifecycle management.
-5. Event-driven alarm worker execution path.
-6. Real FastAPI/Celery workload with distributed tracing.
-7. Richer agent prompt guidance for SSM/X-Ray/log triage behavior.
+| Variable | Purpose |
+|---|---|
+| `COST_OPTIMIZATION_MODE` | `recommend_only` or `take_action` |
+| `COST_OPTIMIZATION_CPU_IDLE_THRESHOLD_PERCENT` | CPU % below which an instance is over-provisioned |
+| `COST_OPTIMIZATION_MAX_ACTIONS_PER_RUN` | Hard cap on resize actions per weekly run |
+| `COST_OPTIMIZATION_CREATE_BACKUP` | Create AMI before resizing in take_action mode |
 
-## 15. Thesis-Oriented Summary
+Full reference: `config/cost_optimization/cost-optimization.worker.env`.
 
-From a systems perspective, this project demonstrates:
+## 14. Key Design Decisions
 
-1. LLM planning over a typed tool layer (MCP).
-2. Separation of concerns between reasoning, protocol dispatch, and cloud API execution.
-3. Policy-constrained autonomy.
-4. End-to-end observability-driven incident analysis.
-5. Persistent auditability of autonomous actions.
-
-This combination makes the architecture suitable for discussing practical autonomous cloud operations, safety controls, and explainable decision trails in an academic setting.
+1. **MCP subprocess model** — tools are discovered dynamically at runtime over stdio; the planner is decoupled from all boto3 details.
+2. **LLM provider abstraction** — the same agent loop works with any provider; tool schemas and message history use a provider-neutral format.
+3. **Goal-aware instruction packs** — system prompt grows only with relevant domain guidance, keeping token overhead proportional to task complexity.
+4. **Lazy policy injection** — full YAML policy content is only inserted into the conversation when a relevant tool is about to be called.
+5. **MUTATING_TOOLS frozenset** — every state-changing tool is enumerated in one place; HITL approval gates and audit logs key off this set.
+6. **Observability delegation** — telemetry-heavy analysis is offloaded to a separate LLM instance with a reduced tool set, preventing CloudWatch/X-Ray payloads from bloating the main planning context.
+7. **Two-tier state persistence** — `state.json` is a fast-lookup snapshot; `audit_log.jsonl` is the authoritative, crash-safe history.
+8. **Per-instance resource isolation** — each EC2 instance owns its own SQS queue, SNS topic, and CloudWatch alarms; a cleanup Lambda removes them atomically on termination.
+9. **ASG launch template sync** — after any vertical resize, the cost worker propagates the new instance type to the ASG launch template so scale-out events inherit the optimized size.

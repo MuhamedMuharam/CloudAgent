@@ -79,7 +79,7 @@ Key fields: `synced`, `asg_name`, `new_instance_type`, `new_lt_version`, `reason
 
 ---
 
-## New MCP Tools
+## MCP Tools
 
 ### Launch Template tools
 
