@@ -1,6 +1,6 @@
 # CloudAgent — Autonomous AI Cloud Infrastructure Manager
 
-An AI agent that autonomously manages AWS infrastructure using natural-language goals and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+An AI agent that autonomously manages cloud infrastructure using natural-language goals and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). The current implementation targets **AWS**, with the architecture designed to extend to Azure and GCP.
 
 ---
 
@@ -29,8 +29,8 @@ main.py  ──►  agent/core.py (async planning loop)
                   ├─ agent/state_manager.py  persists state/ directory
                   └─ agent/observability_helper.py  sub-agent for telemetry analysis
 
-alarm_worker.py          long-running SQS polling loop → auto-mitigates CloudWatch alarms
-cost_optimization_worker.py  weekly vertical rightsizing analysis — optimizes instance types, not fleet size (runs as ECS Fargate task)
+alarm_worker.py   ──►    long-running SQS polling loop → auto-mitigates CloudWatch alarms
+cost_optimization_worker.py ──►   weekly vertical rightsizing analysis — optimizes instance types, not fleet size (runs as ECS Fargate task)
 ```
 
 ### IAM Identity Split
@@ -617,3 +617,10 @@ goal = "Add a CPU target-tracking scaling policy to ai-agent-fleet with a 60% ta
 - `ai-agent-cloud/docs/HorizontalScalingGuide.md` — ASG and Launch Template integration
 - `ai-agent-cloud/docs/STATE_FILES_GUIDE.md` — state file schema and audit log format
 - `ai-agent-cloud/policies/aws_policies.yaml` — policy rules enforced before every cloud API call
+
+---
+
+## Future Implementations
+
+- 🚧 **Azure VM management** — parallel to the AWS implementation; MCP server stub already wired in
+- 🚧 **GCP Compute Engine** — complete multi-cloud coverage alongside AWS and Azure

@@ -34,9 +34,6 @@ mcp = FastMCP("mcp-aws-server")
 # Initialize EC2 manager with region from environment
 region = os.getenv('AWS_REGION', 'us-east-1')
 default_dashboard_name = os.getenv('CW_DASHBOARD_NAME')
-default_log_group = os.getenv('CW_TEST_LOG_GROUP')
-default_instance_id = os.getenv('CW_TEST_INSTANCE_ID')
-default_sns_arn = os.getenv('CW_TEST_SNS_ARN')
 default_alarm_queue_url = os.getenv('ALARM_SQS_QUEUE_URL')
 print(f"🚀 Initializing MCP AWS Server (region: {region})", file=sys.stderr)
 
@@ -67,85 +64,6 @@ except Exception as e:
     sys.exit(1)
 
 
-def _build_observability_snapshot(
-    instance_id: str = None,
-    log_group_name: str = None,
-    minutes: int = 15,
-    metric_period_seconds: int = 60,
-    log_limit: int = 50,
-    alarm_state: str = None,
-) -> dict:
-    """
-    Build a compact observability snapshot combining metrics, logs, and alarms.
-    """
-    resolved_instance_id = instance_id or default_instance_id
-    resolved_log_group = log_group_name or default_log_group
-
-    snapshot = {
-        "region": region,
-        "window_minutes": minutes,
-        "instance_id": resolved_instance_id,
-        "log_group_name": resolved_log_group,
-        "metrics": None,
-        "recent_logs": None,
-        "alarms": None,
-    }
-
-    if resolved_instance_id:
-        try:
-            snapshot["metrics"] = cloudwatch_manager.get_ec2_metrics(
-                instance_id=resolved_instance_id,
-                minutes=minutes,
-                period_seconds=metric_period_seconds,
-            )
-        except Exception as metrics_error:
-            snapshot["metrics"] = {"error": str(metrics_error)}
-
-        try:
-            alarms = cloudwatch_manager.list_alarms(
-                state_value=alarm_state,
-                alarm_name_prefix=None,
-                max_records=100,
-            )
-            matched_alarms = []
-            for alarm in alarms:
-                dims = alarm.get("dimensions", [])
-                if any(d.get("name") == "InstanceId" and d.get("value") == resolved_instance_id for d in dims):
-                    matched_alarms.append(alarm)
-
-            snapshot["alarms"] = {
-                "count": len(matched_alarms),
-                "items": matched_alarms,
-            }
-        except Exception as alarms_error:
-            snapshot["alarms"] = {"error": str(alarms_error)}
-
-    if resolved_log_group:
-        try:
-            logs_result = cloudwatch_manager.filter_logs(
-                log_group_name=resolved_log_group,
-                filter_pattern="",
-                minutes=minutes,
-                limit=log_limit,
-            )
-            snapshot["recent_logs"] = logs_result
-        except Exception as logs_error:
-            snapshot["recent_logs"] = {"error": str(logs_error)}
-
-    return snapshot
-
-
-def _metric_values_from_series(metrics_bucket: dict, metric_name: str) -> list:
-    metric_item = metrics_bucket.get(metric_name, {}) if isinstance(metrics_bucket, dict) else {}
-    datapoints = metric_item.get("datapoints", []) if isinstance(metric_item, dict) else []
-    values = []
-    for datapoint in datapoints:
-        value = datapoint.get("value")
-        if isinstance(value, (int, float)):
-            values.append(float(value))
-    return values
-
-
 def _normalize_metric_scope(scope: str) -> str:
     normalized = re.sub(r"[\s_]+", "-", (scope or "all").strip().lower())
     if normalized.endswith("-only"):
@@ -162,16 +80,6 @@ def _normalize_metric_scope(scope: str) -> str:
         "io": "disk",
     }
     return aliases.get(normalized, normalized)
-
-
-def _canonical_metric_name(metric_name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (metric_name or "").strip().lower())
-
-
-def _average(values: list):
-    if not values:
-        return None
-    return sum(values) / len(values)
 
 
 def _resolve_cost_metric_period(
@@ -264,50 +172,6 @@ def _build_scoped_metrics_view(metrics_payload: dict, scope: str) -> dict:
         "scope": normalized_scope,
         "metrics": selected_primary,
         "agent_metrics": selected_agent,
-        "availability_summary": {
-            "primary": _summarize_metric_bucket(selected_primary),
-            "agent": _summarize_metric_bucket(selected_agent),
-        },
-    }
-
-
-def _build_metric_name_filtered_view(metrics_payload: dict, metric_names: list) -> dict:
-    primary_metrics = metrics_payload.get("metrics", {}) if isinstance(metrics_payload, dict) else {}
-    agent_metrics = metrics_payload.get("agent_metrics", {}) if isinstance(metrics_payload, dict) else {}
-
-    requested_metric_names = [str(name).strip() for name in (metric_names or []) if str(name).strip()]
-    lookup = {}
-
-    for key, value in primary_metrics.items():
-        lookup[_canonical_metric_name(key)] = ("metrics", key, value)
-    for key, value in agent_metrics.items():
-        lookup[_canonical_metric_name(key)] = ("agent_metrics", key, value)
-
-    selected_primary = {}
-    selected_agent = {}
-    resolved_metric_names = []
-    missing_metric_names = []
-
-    for requested_name in requested_metric_names:
-        canonical = _canonical_metric_name(requested_name)
-        hit = lookup.get(canonical)
-        if not hit:
-            missing_metric_names.append(requested_name)
-            continue
-
-        bucket_name, key, value = hit
-        resolved_metric_names.append(key)
-        if bucket_name == "metrics":
-            selected_primary[key] = value
-        else:
-            selected_agent[key] = value
-
-    return {
-        "metrics": selected_primary,
-        "agent_metrics": selected_agent,
-        "requested_metric_names": requested_metric_names,
-        "resolved_metric_names": sorted(set(resolved_metric_names)),
-        "missing_metric_names": missing_metric_names,
         "availability_summary": {
             "primary": _summarize_metric_bucket(selected_primary),
             "agent": _summarize_metric_bucket(selected_agent),
@@ -1798,7 +1662,7 @@ async def aws_get_ec2_metrics(
     Get recent EC2 CloudWatch metrics for an instance.
 
     Args:
-        instance_id: EC2 instance ID (optional if CW_TEST_INSTANCE_ID is set)
+        instance_id: EC2 instance ID
         minutes: Lookback window in minutes (default: 15)
         period_seconds: Metric period in seconds (default: 60)
         include_agent_metrics: Include CloudWatch Agent metrics (disk, mem, swap, io, netstat)
@@ -1808,15 +1672,14 @@ async def aws_get_ec2_metrics(
         Dictionary with EC2 metrics and optional CloudWatch Agent metrics
     """
     try:
-        resolved_instance_id = instance_id or default_instance_id
-        if not resolved_instance_id:
+        if not instance_id:
             return {
                 "success": False,
-                "error": "Missing instance_id. Provide one or set CW_TEST_INSTANCE_ID in environment."
+                "error": "Missing instance_id."
             }
 
         metrics_payload = cloudwatch_manager.get_ec2_metrics(
-            instance_id=resolved_instance_id,
+            instance_id=instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
             include_agent_metrics=include_agent_metrics,
@@ -1855,15 +1718,14 @@ async def aws_get_ec2_metrics_scoped(
     - memory
     """
     try:
-        resolved_instance_id = instance_id or default_instance_id
-        if not resolved_instance_id:
+        if not instance_id:
             return {
                 "success": False,
-                "error": "Missing instance_id. Provide one or set CW_TEST_INSTANCE_ID in environment."
+                "error": "Missing instance_id."
             }
 
         metrics_payload = cloudwatch_manager.get_ec2_metrics(
-            instance_id=resolved_instance_id,
+            instance_id=instance_id,
             minutes=minutes,
             period_seconds=period_seconds,
             include_agent_metrics=include_agent_metrics,
@@ -1874,7 +1736,7 @@ async def aws_get_ec2_metrics_scoped(
 
         return {
             "success": True,
-            "instance_id": resolved_instance_id,
+            "instance_id": instance_id,
             "minutes": minutes,
             "period_seconds": period_seconds,
             "scope": scoped_view.get("scope"),
@@ -1923,7 +1785,7 @@ async def aws_list_log_streams(log_group_name: str = None, limit: int = 25, desc
     List log streams in a CloudWatch log group.
 
     Args:
-        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        log_group_name: CloudWatch log group name
         limit: Maximum streams to return (default: 25)
         descending: Newest streams first when True
 
@@ -1931,21 +1793,20 @@ async def aws_list_log_streams(log_group_name: str = None, limit: int = 25, desc
         Dictionary with log streams
     """
     try:
-        resolved_log_group = log_group_name or default_log_group
-        if not resolved_log_group:
+        if not log_group_name:
             return {
                 "success": False,
-                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+                "error": "Missing log_group_name."
             }
 
         streams = cloudwatch_manager.list_log_streams(
-            log_group_name=resolved_log_group,
+            log_group_name=log_group_name,
             limit=limit,
             descending=descending,
         )
         return {
             "success": True,
-            "log_group_name": resolved_log_group,
+            "log_group_name": log_group_name,
             "count": len(streams),
             "log_streams": streams
         }
@@ -1967,7 +1828,7 @@ async def aws_get_log_events(
     Get events from a specific CloudWatch log stream.
 
     Args:
-        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        log_group_name: CloudWatch log group name
         log_stream_name: Log stream name (optional; newest stream is used if omitted)
         limit: Max events (default: 100)
         start_from_head: If True, fetch oldest first
@@ -1976,29 +1837,28 @@ async def aws_get_log_events(
         Dictionary with log events
     """
     try:
-        resolved_log_group = log_group_name or default_log_group
-        if not resolved_log_group:
+        if not log_group_name:
             return {
                 "success": False,
-                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+                "error": "Missing log_group_name."
             }
 
         resolved_log_stream = log_stream_name
         if not resolved_log_stream:
             streams = cloudwatch_manager.list_log_streams(
-                log_group_name=resolved_log_group,
+                log_group_name=log_group_name,
                 limit=1,
                 descending=True,
             )
             if not streams:
                 return {
                     "success": False,
-                    "error": f"No log streams found in log group: {resolved_log_group}"
+                    "error": f"No log streams found in log group: {log_group_name}"
                 }
             resolved_log_stream = streams[0].get("log_stream_name")
 
         result = cloudwatch_manager.get_log_events(
-            log_group_name=resolved_log_group,
+            log_group_name=log_group_name,
             log_stream_name=resolved_log_stream,
             limit=limit,
             start_from_head=start_from_head,
@@ -2025,7 +1885,7 @@ async def aws_filter_logs(
     Filter CloudWatch log events by pattern over a recent time window.
 
     Args:
-        log_group_name: CloudWatch log group name (optional if CW_TEST_LOG_GROUP is set)
+        log_group_name: CloudWatch log group name
         filter_pattern: CloudWatch filter pattern (empty means no filter)
         minutes: Lookback in minutes (default: 15)
         limit: Max events (default: 100)
@@ -2034,15 +1894,14 @@ async def aws_filter_logs(
         Dictionary with filtered log events
     """
     try:
-        resolved_log_group = log_group_name or default_log_group
-        if not resolved_log_group:
+        if not log_group_name:
             return {
                 "success": False,
-                "error": "Missing log_group_name. Provide one or set CW_TEST_LOG_GROUP in environment."
+                "error": "Missing log_group_name."
             }
 
         result = cloudwatch_manager.filter_logs(
-            log_group_name=resolved_log_group,
+            log_group_name=log_group_name,
             filter_pattern=filter_pattern,
             minutes=minutes,
             limit=limit,
@@ -2103,20 +1962,21 @@ async def aws_list_ec2_alarms(
     """
     List CloudWatch alarms related to a specific EC2 instance.
 
-    This tool resolves alarms by CloudWatch metric dimensions (InstanceId),
-    which is more reliable than filtering by alarm-name prefix.
+    Provide EITHER instance_id OR instance_name — the tool resolves the name to an ID
+    automatically. Alarms are matched by the InstanceId CloudWatch metric dimension,
+    which is more reliable than alarm-name prefix filtering.
 
     Args:
-        instance_id: EC2 instance ID (optional if instance_name is provided)
-        instance_name: EC2 Name tag (optional if instance_id is provided)
-        state_value: Optional state filter (OK, ALARM, INSUFFICIENT_DATA)
+        instance_id: EC2 instance ID (e.g. i-0abc123). Use this OR instance_name.
+        instance_name: EC2 Name tag (e.g. "TestWebServer"). Use this OR instance_id.
+        state_value: Optional state filter — OK | ALARM | INSUFFICIENT_DATA
         max_records: Maximum records to retrieve before filtering
 
     Returns:
         Dictionary with resolved instance and matching alarms
     """
     try:
-        resolved_instance_id = instance_id or default_instance_id
+        resolved_instance_id = instance_id
         resolved_instance_name = instance_name
 
         # Resolve instance ID by name if needed
@@ -2292,11 +2152,6 @@ async def aws_create_metric_alarm(
         Dictionary with alarm creation status
     """
     try:
-        if not alarm_actions and default_sns_arn:
-            alarm_actions = [default_sns_arn]
-        if not ok_actions and default_sns_arn:
-            ok_actions = [default_sns_arn]
-
         result = cloudwatch_manager.create_metric_alarm(
             alarm_name=alarm_name,
             metric_name=metric_name,
