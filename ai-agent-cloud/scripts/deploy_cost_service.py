@@ -35,7 +35,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ── Configurable - change these if you need different names or schedules ─────
-REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+REGION = os.getenv("AWS_REGION", "us-east-1")
 
 TASK_ROLE_NAME      = "CostOptWorkerTaskRole"
 EXEC_ROLE_NAME      = "CostOptWorkerExecRole"

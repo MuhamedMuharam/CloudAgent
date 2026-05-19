@@ -161,7 +161,7 @@ OPENAI_API_KEY=sk-proj-...
 # AWS — use the ai-agent IAM user key created in step 1.4
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
-AWS_DEFAULT_REGION=us-east-1
+AWS_REGION=us-east-1
 
 # IAM user ARN — used by instance_alarm_setup.py to grant the alarm_worker SQS access
 AGENT_IAM_USER_ARN=arn:aws:iam::ACCOUNT_ID:user/ai-agent
@@ -248,6 +248,8 @@ From the AWS console, launch an **Amazon Linux 2023** instance and:
 ssh -i your-key.pem ec2-user@<PUBLIC_IP>
 ```
 
+Note: `your-key.pem` is the local path to your EC2 key pair file.
+
 ### 2.3 — Update the system and install Git
 
 ```bash
@@ -300,7 +302,7 @@ OPENAI_API_KEY=sk-proj-...
 # ai-agent IAM user credentials (from step 1.4)
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
-AWS_DEFAULT_REGION=us-east-1
+AWS_REGION=us-east-1
 
 # IAM user ARN — lets instance_alarm_setup.py grant SQS access to the alarm worker
 AGENT_IAM_USER_ARN=arn:aws:iam::ACCOUNT_ID:user/ai-agent
@@ -323,6 +325,8 @@ sudo bash scripts/setup_xray.sh
 ```
 
 ### 2.9 — Install and configure the CloudWatch agent
+
+Note: If you want to adjust the metrics collected, edit the CloudWatch agent config file first, then run the setup script.
 
 ```bash
 sudo bash scripts/setup_cloudwatch_agent.sh
@@ -353,16 +357,16 @@ Once the script completes, `ai-agent.service` should be `active (running)` and `
 
 Full reference is in `.env.example`. The most important variables for a fresh deployment:
 
-| Variable                 | Where set                                 | Description                                                 |
-| ------------------------ | ----------------------------------------- | ----------------------------------------------------------- |
-| `OPENAI_API_KEY`         | `.env`                                    | OpenAI API key for the agent's GPT model                    |
-| `AWS_ACCESS_KEY_ID`      | `.env`                                    | ai-agent IAM user key (from `setup_iam.py`)                 |
-| `AWS_SECRET_ACCESS_KEY`  | `.env`                                    | ai-agent IAM user secret                                    |
-| `AWS_DEFAULT_REGION`     | `.env`                                    | AWS region (default: `us-east-1`)                           |
-| `AGENT_IAM_USER_ARN`     | `.env`                                    | ARN of the ai-agent IAM user — grants it SQS access         |
-| `ALARM_SQS_QUEUE_URL`    | auto-patched by `instance_alarm_setup.py` | SQS queue URL for the alarm worker                          |
-| `COST_OPTIMIZATION_MODE` | `.env`                                    | `recommend_only` (safe default) or `take_action`            |
-| `HITL_ENABLED`           | `.env`                                    | `true` to require human approval before destructive actions |
+| Variable                 | Where set                                 | Description                                                                                                                                                                                    |
+| ------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`         | `.env`                                    | OpenAI API key for the agent's GPT model                                                                                                                                                       |
+| `AWS_ACCESS_KEY_ID`      | `.env`                                    | ai-agent IAM user key (from `setup_iam.py`)                                                                                                                                                    |
+| `AWS_SECRET_ACCESS_KEY`  | `.env`                                    | ai-agent IAM user secret                                                                                                                                                                       |
+| `AWS_REGION`             | `.env`                                    | AWS region (default: `us-east-1`)                                                                                                                                                              |
+| `AGENT_IAM_USER_ARN`     | `.env`                                    | ARN of the ai-agent IAM user — grants it SQS access                                                                                                                                            |
+| `ALARM_SQS_QUEUE_URL`    | auto-patched by `instance_alarm_setup.py` | SQS queue URL for the alarm worker                                                                                                                                                             |
+| `COST_OPTIMIZATION_MODE` | `.env`                                    | `recommend_only` (safe default) or `take_action`                                                                                                                                               |
+| `HITL_ENABLED`           | `.env`                                    | `true` to require human approval before destructive actions                                                                                                                                    |
 | `HITL_EMAIL_TO`          | `.env`                                    | **Mandatory when `HITL_ENABLED=true`** — email address that receives approve/deny requests; leaving this blank means approval emails are never sent and the agent will auto-deny after timeout |
 
 ---
@@ -378,12 +382,16 @@ sudo systemctl status ai-agent.service
 # Per-instance setup completed (SQS/SNS/alarms created)
 sudo systemctl status ai-agent-setup.service
 
+systemctl list-units --type=service --state=running
+
 sudo tail -f /var/log/ai-agent/agent.log
 ```
 
 Expected results:
+
 - `ai-agent.service` shows `Active: active (running)`.
 - `ai-agent-setup.service` shows `Active: inactive (dead)` with `status=0/SUCCESS`.
+- The running services list includes `ai-agent.service`, `xray.service`, and `amazon-cloudwatch-agent.service`.
 - The log tail prints new entries as the worker runs, without repeated errors.
 
 If `ai-agent-setup.service` exited with a non-zero status, check `sudo journalctl -u ai-agent-setup.service` for the error.
@@ -427,7 +435,7 @@ After triggering, watch the run in **CloudWatch → Log management → Log group
 
 ## Running the Agent
 
-Once the infrastructure is in place, interact with the agent directly from your local machine:
+Once the infrastructure is in place, interact with the agent directly from your **local machine**:
 
 ```bash
 # activate local venv

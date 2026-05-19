@@ -14,7 +14,7 @@ Then patches the .env file with the new ALARM_SQS_QUEUE_URL so the
 alarm worker on this instance only receives its own alarm notifications.
 
 Environment variables (all optional, have defaults):
-  AWS_DEFAULT_REGION   - AWS region (default: us-east-1)
+    AWS_REGION           - AWS region (default: us-east-1)
   ENV_FILE_PATH        - path to the .env file to patch
                          (default: /home/ec2-user/ai-agent-cloud/.env)
   AGENT_IAM_USER_ARN   - ARN of the ai-agent IAM user that polls SQS
@@ -42,7 +42,7 @@ for _var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
 import boto3
 from botocore.exceptions import ClientError
 
-REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+REGION = os.getenv("AWS_REGION", "us-east-1")
 ENV_FILE = os.getenv("ENV_FILE_PATH", "/home/ec2-user/CloudAgent/ai-agent-cloud/.env")
 AGENT_IAM_USER_ARN = os.getenv("AGENT_IAM_USER_ARN", "")
 DISK_DEVICE = os.getenv("DISK_DEVICE", "nvme0n1p1")

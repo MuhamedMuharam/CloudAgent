@@ -23,7 +23,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ── Configurable ──────────────────────────────────────────────────────────────
-REGION        = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+REGION        = os.getenv("AWS_REGION", "us-east-1")
 ROLE_NAME     = "ai-agent-cleanup-lambda-role"
 FUNCTION_NAME = "ai-agent-instance-alarm-cleanup"
 RULE_NAME     = "ai-agent-instance-terminated"
