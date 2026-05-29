@@ -120,7 +120,7 @@ def setup_iam_user(iam, account_id: str, region: str) -> None:
                         "ssm:GetParameters",
                         "ssm:GetParametersByPath",
                     ],
-                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/cloudagent/cost/prod/*",
+                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/aicloudpilot/cost/prod/*",
                 },
             ],
         }),

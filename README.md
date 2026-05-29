@@ -1,4 +1,4 @@
-# CloudAgent — Autonomous AI Cloud Infrastructure Manager
+# AICloudPilot — Autonomous AI Cloud Infrastructure Manager
 
 An AI agent that autonomously manages cloud infrastructure using natural-language goals and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). The current implementation targets **AWS**, with the architecture designed to extend to Azure and GCP.
 
@@ -71,8 +71,8 @@ All scripts are in `ai-agent-cloud/scripts/`.
 ### 1.1 — Clone the repository
 
 ```bash
-git clone https://github.com/MuhamedMuharam/CloudAgent.git
-cd CloudAgent/ai-agent-cloud
+git clone https://github.com/MuhamedMuharam/AICloudPilot.git
+cd AICloudPilot/ai-agent-cloud
 ```
 
 ### 1.2 — Set up a local Python environment for the scripts
@@ -260,8 +260,8 @@ sudo dnf install -y git
 ### 2.4 — Clone the repository
 
 ```bash
-git clone https://github.com/MuhamedMuharam/CloudAgent.git
-cd CloudAgent/ai-agent-cloud
+git clone https://github.com/MuhamedMuharam/AICloudPilot.git
+cd AICloudPilot/ai-agent-cloud
 ```
 
 ### 2.5 — Install Python 3.11 and set up the virtual environment

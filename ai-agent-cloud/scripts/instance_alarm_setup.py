@@ -43,7 +43,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
-ENV_FILE = os.getenv("ENV_FILE_PATH", "/home/ec2-user/CloudAgent/ai-agent-cloud/.env")
+ENV_FILE = os.getenv("ENV_FILE_PATH", "/home/ec2-user/AICloudPilot/ai-agent-cloud/.env")
 AGENT_IAM_USER_ARN = os.getenv("AGENT_IAM_USER_ARN", "")
 DISK_DEVICE = os.getenv("DISK_DEVICE", "nvme0n1p1")
 DISK_FSTYPE = os.getenv("DISK_FSTYPE", "xfs")

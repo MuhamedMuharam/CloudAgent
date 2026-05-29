@@ -188,7 +188,7 @@ def setup_exec_role(iam, account_id: str) -> str:
                     "Effect": "Allow",
                     "Action": ["ssm:GetParameters"],
                     "Resource": [
-                        f"arn:aws:ssm:{REGION}:{account_id}:parameter/cloudagent/cost/prod/*",
+                        f"arn:aws:ssm:{REGION}:{account_id}:parameter/aicloudpilot/cost/prod/*",
                     ],
                 },
                 {
